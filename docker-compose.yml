@@ -1,0 +1,62 @@
+# The whole demo on one laptop: a Temporal dev server, the fulfilment Worker, the console (API plus
+# the built React app), and the simulated SNS/OSS provider and Portfolio. `make up` starts it.
+services:
+  temporal:
+    image: temporalio/temporal:1.10.1
+    command: >-
+      server start-dev --ip 0.0.0.0 --ui-port 8233 --log-level warn
+      --search-attribute RowStatus=Keyword --search-attribute AccountId=Keyword
+    ports:
+      - "127.0.0.1:7233:7233"
+      - "127.0.0.1:8233:8233"
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--disable-config-file", "--address", "127.0.0.1:7233"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  downstream:
+    build: { context: ., dockerfile: docker/downstream.Dockerfile }
+    environment:
+      PORT: "8090"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8090/admin/state').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  worker:
+    build: { context: ., dockerfile: docker/fulfilment.Dockerfile, target: worker }
+    environment: &temporal-env
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-broadband-fulfilment}
+      DOWNSTREAM_URL: http://downstream:8090
+    depends_on:
+      temporal: { condition: service_healthy }
+      downstream: { condition: service_healthy }
+
+  api:
+    build: { context: ., dockerfile: docker/fulfilment.Dockerfile, target: api }
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      <<: *temporal-env
+      TEMPORAL_UI_URL: http://localhost:8233
+      PORT: "8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/console').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      temporal: { condition: service_healthy }
+      downstream: { condition: service_healthy }
+
+  test:
+    build: { context: ., dockerfile: docker/fulfilment.Dockerfile, target: test }
+    profiles: [test]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on:
+      temporal: { condition: service_healthy }
