@@ -257,7 +257,7 @@ p { margin: 0; }
   .stage + .stage::before { content: '↓'; left: 0; top: -1rem; }
 }
 
-.retired { list-style: none; margin: 0.5rem 0 0; padding: 0; display: grid; gap: 0.3rem; }
+.retired, .cease-steps { list-style: none; margin: 0.5rem 0 0; padding: 0; display: grid; gap: 0.3rem; }
 
 .add-step { justify-self: start; }
 .add-step-form { display: grid; gap: 0.5rem; padding: 0.6rem; border: 1px dashed var(--border-strong); border-radius: 6px; background: var(--surface); }

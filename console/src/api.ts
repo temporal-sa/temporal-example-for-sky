@@ -79,6 +79,20 @@ export interface LineListItem extends LineSummary {
   steps: Record<string, StepState>;
   awaiting: EventName[];
   phase: string;
+  // Set once the portfolio has started a cease for this live line.
+  cease: { status: 'CEASING' | 'CEASED' } | null;
+}
+
+// A live line's cease, which runs as its own Workflow after the line's Workflow has ended.
+export interface CeaseView {
+  lineId: string;
+  reason: string;
+  replacedBy?: string;
+  status: 'CEASING' | 'CEASED';
+  rowStatus: RowStatus;
+  steps: { stepId: string; name: string; state: StepState }[];
+  awaiting: EventName[];
+  phase: string;
 }
 
 export interface PendingWork {
@@ -88,21 +102,27 @@ export interface PendingWork {
   nextAttemptAt?: string;
 }
 
-export interface LineDetail extends LineListItem {
-  route?: Route;
+export interface LineDetail extends Omit<LineListItem, 'cease'> {
+  route: Route | null;
   retired: { id: string; name: string; fromVersion: number; state: StepState }[];
+  cease: CeaseView | null;
+  // From the Workflows' history Query. historyCurrent is false when no Worker answered it, so the
+  // entries (if any) are the last ones the API saw.
   timeline: TimelineEntry[];
+  historyCurrent: boolean;
   pendingWork: PendingWork[];
   temporalUrl: string;
+  ceaseTemporalUrl: string | null;
 }
 
 export type OrderItem = { type: 'ADD'; product: ProductCode; replaces?: string } | { type: 'CEASE'; lineId: string };
 
+export type PortfolioLine = LineSummary & { ceaseRequested?: boolean; ceaseStarted?: boolean; released?: boolean };
+
 export interface Portfolio {
   accountId: string;
-  lines: (LineSummary & { ceaseRequested?: boolean })[];
+  lines: PortfolioLine[];
   orders: { orderId: string; placedAt: string; items: OrderItem[]; bundleBehaviour?: BundleBehaviour; lineIds: string[] }[];
-  timeline: TimelineEntry[];
 }
 
 export interface CustomerSummary {
@@ -133,7 +153,14 @@ export interface DownstreamState {
 
 export interface ConsoleData {
   customers: CustomerSummary[];
-  selected: { portfolio: Portfolio; lines: LineListItem[]; pendingWork: PendingWork[]; temporalUrl: string } | null;
+  selected: {
+    portfolio: Portfolio;
+    lines: LineListItem[];
+    timeline: TimelineEntry[];
+    historyCurrent: boolean;
+    pendingWork: PendingWork[];
+    temporalUrl: string;
+  } | null;
   line: LineDetail | null;
   routes: Route[];
   downstream: DownstreamState | null;
@@ -160,8 +187,8 @@ export const api = {
   // Every customer change is an order on their portfolio: new products, upgrades, cancellations.
   placeOrder: (accountId: string, items: OrderItem[], bundleBehaviour?: BundleBehaviour) =>
     post<Portfolio>('/api/orders', { accountId, orderId: newOrderId(), items, bundleBehaviour }),
-  sendEvent: (lineId: string, type: EventName) => post<{ accepted: boolean }>(`/api/lines/${lineId}/events`, { type }),
-  changeRoute: (lineId: string, version: number, compensate: boolean) => post<LineDetail>(`/api/lines/${lineId}/route`, { version, compensate }),
+  sendEvent: (lineId: string, type: EventName) => post<{ accepted: boolean; to: string }>(`/api/lines/${lineId}/events`, { type }),
+  changeRoute: (lineId: string, version: number, compensate: boolean) => post<{ version: number }>(`/api/lines/${lineId}/route`, { version, compensate }),
   publishRoute: (route: Pick<Route, 'product' | 'description' | 'stages'>) =>
     post<Route>(`/api/routes/${route.product}`, { description: route.description, stages: route.stages }),
   setMode: (system: System, mode: Mode) =>

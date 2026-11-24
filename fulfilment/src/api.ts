@@ -1,6 +1,8 @@
 // The fulfilment console's API. The console loads from one request (GET /api/console), and each
-// action is one request that makes one Temporal call. State comes from the Workflows' memo through
-// List and Describe, never a Query, so the console keeps working while the Worker is down.
+// action is one request that makes one Temporal call. State comes from the Workflows' memos through
+// List and Describe, so the console keeps working while the Worker is down. The only Query is
+// `history`, for the detail views, and the API sends it only when a memo's `rev` says the history
+// has changed: an open console doesn't Query on every refresh.
 import fastifyStatic from '@fastify/static';
 import {
   Client,
@@ -14,6 +16,7 @@ import Fastify, { type FastifyReply } from 'fastify';
 import { requiredEnv, temporalConfig } from './config.js';
 import {
   type BundleBehaviour,
+  type CeaseView,
   EVENTS,
   type EventName,
   type LineView,
@@ -22,11 +25,13 @@ import {
   PRODUCTS,
   type ProductCode,
   type Route,
+  type TimelineEntry,
+  ceaseWorkflowId,
   lineWorkflowId,
   portfolioWorkflowId,
   routeProblems,
 } from './domain.js';
-import { changeRouteUpdate, lineEventSignal, placeOrderUpdate } from './messages.js';
+import { changeRouteUpdate, historyQuery, lineEventSignal, placeOrderUpdate } from './messages.js';
 import { AccountIdAttribute } from './search-attributes.js';
 import type { portfolio } from './workflows.js';
 
@@ -36,7 +41,8 @@ const temporalUiUrl = requiredEnv('TEMPORAL_UI_URL');
 const consoleDir = process.env.CONSOLE_DIR;
 const { connectionOptions, namespace } = temporalConfig();
 
-const client = new Client({ connection: await Connection.connect(connectionOptions), namespace });
+const connection = await Connection.connect(connectionOptions);
+const client = new Client({ connection, namespace });
 
 const ORDER_ID = /^ORD-[0-9A-Z]{6}$/;
 const ACCOUNT_ID = /^ACC-[0-9]{6}$/;
@@ -83,27 +89,95 @@ async function describe(workflowId: string) {
   }
 }
 
+// --- History, through the `history` Query --------------------------------------------------------
+
+const HISTORY_CACHE = 500;
+const QUERY_DEADLINE_MS = 2_000;
+const RETRY_FAILED_QUERY_MS = 30_000;
+const histories = new Map<string, { rev: number; timeline?: TimelineEntry[]; failedAt?: number }>();
+
+// A Workflow's history, as of its memo's `rev`. The Query runs only when `rev` has moved on, so it
+// costs one Query per change, not one per refresh. A Query needs a Worker: while it's down, this
+// returns the last history it got (current: false), or none, and doesn't keep the console waiting.
+async function history(workflowId: string, rev: number): Promise<{ entries: TimelineEntry[]; current: boolean } | null> {
+  const cached = histories.get(workflowId);
+  if (cached?.rev === rev && cached.timeline) return { entries: cached.timeline, current: true };
+  if (cached?.failedAt && Date.now() - cached.failedAt < RETRY_FAILED_QUERY_MS) return cached.timeline ? { entries: cached.timeline, current: false } : null;
+  try {
+    const timeline = await connection.withDeadline(Date.now() + QUERY_DEADLINE_MS, () => client.workflow.getHandle(workflowId).query(historyQuery));
+    histories.delete(workflowId);
+    histories.set(workflowId, { rev, timeline });
+    if (histories.size > HISTORY_CACHE) histories.delete(histories.keys().next().value!);
+    return { entries: timeline, current: true };
+  } catch {
+    histories.set(workflowId, { rev: cached?.rev ?? -1, timeline: cached?.timeline, failedAt: Date.now() });
+    return cached?.timeline ? { entries: cached.timeline, current: false } : null;
+  }
+}
+
+// --- Lines -----------------------------------------------------------------------------------------
+
+// A live line's cease runs in its own Workflow. The console shows one line, so once a cease has
+// started, its state (row, billing, what it's waiting for) is the line's state.
+function withCease(line: LineView, cease: CeaseView | undefined) {
+  if (!cease) return { ...line, cease: null };
+  return {
+    ...line,
+    status: cease.status === 'CEASED' ? ('CEASED' as const) : line.status,
+    rowStatus: cease.rowStatus,
+    billing: cease.billing,
+    phase: cease.phase,
+    awaiting: cease.awaiting,
+    cease,
+  };
+}
+
 async function lineDetail(lineId: string) {
-  const description = await describe(lineWorkflowId(lineId));
-  const line = description?.memo?.line as LineView | undefined;
-  if (!description || !line) return undefined;
-  return { ...line, pendingWork: pendingWork(description), temporalUrl: executionUrl(lineWorkflowId(lineId)) };
+  const [lineDescription, ceaseDescription] = await Promise.all([describe(lineWorkflowId(lineId)), describe(ceaseWorkflowId(lineId))]);
+  const line = lineDescription?.memo?.line as LineView | undefined;
+  if (!lineDescription || !line) return undefined;
+  const cease = ceaseDescription?.memo?.cease as CeaseView | undefined;
+  const [lineHistory, ceaseHistory] = await Promise.all([
+    history(lineWorkflowId(lineId), line.rev),
+    cease ? history(ceaseWorkflowId(lineId), cease.rev) : null,
+  ]);
+  const timeline = [...(lineHistory?.entries ?? []), ...(ceaseHistory?.entries ?? [])].sort((a, b) => a.at.localeCompare(b.at));
+  return {
+    ...withCease(line, cease),
+    timeline,
+    historyCurrent: lineHistory?.current === true && (!cease || ceaseHistory?.current === true),
+    pendingWork: [...pendingWork(lineDescription), ...(ceaseDescription ? pendingWork(ceaseDescription) : [])],
+    temporalUrl: executionUrl(lineWorkflowId(lineId)),
+    ceaseTemporalUrl: cease ? executionUrl(ceaseWorkflowId(lineId)) : null,
+  };
 }
 
 async function customer(accountId: string) {
   const id = portfolioWorkflowId(accountId);
-  const [description, lines] = await Promise.all([
+  const [description, executions] = await Promise.all([
     describe(id),
-    list(`WorkflowType="productLine" AND AccountId="${accountId}" AND ${IN_DEMO}`, (memo) => memo?.line as LineView | undefined),
+    list(`(WorkflowType="productLine" OR WorkflowType="ceaseLine") AND AccountId="${accountId}" AND ${IN_DEMO}`, (memo) =>
+      memo as { line?: LineView; cease?: CeaseView } | undefined,
+    ),
   ]);
   const portfolio = description?.memo?.portfolio as PortfolioView | undefined;
   if (!portfolio) return undefined;
+  const portfolioHistory = await history(id, portfolio.rev);
+  const ceases = new Map(executions.flatMap((e) => (e.cease ? [[e.cease.lineId, e.cease] as const] : [])));
+  const known = new Map(portfolio.lines.map((l, index) => [l.lineId, { line: l, index }]));
   return {
-    portfolio,
+    portfolio: { ...portfolio, lines: portfolio.lines.map(({ undo: _undo, ...rest }) => rest) },
     // In the order the portfolio took them on, so a replacement sits after the line it replaces.
-    lines: lines
-      .map(({ timeline: _timeline, route: _route, ...rest }) => rest)
-      .sort((a, b) => portfolio.lines.findIndex((l) => l.lineId === a.lineId) - portfolio.lines.findIndex((l) => l.lineId === b.lineId)),
+    lines: executions
+      .flatMap((e) => (e.line ? [e.line] : []))
+      .map(({ undo: _undo, ...line }) => {
+        const merged = withCease(line, ceases.get(line.lineId));
+        // The portfolio decides a replacement; a line that had already finished never heard of it.
+        return { ...merged, replacedBy: merged.replacedBy ?? known.get(line.lineId)?.line.replacedBy, cease: merged.cease ? { status: merged.cease.status } : null };
+      })
+      .sort((a, b) => (known.get(a.lineId)?.index ?? 0) - (known.get(b.lineId)?.index ?? 0)),
+    timeline: portfolioHistory?.entries ?? [],
+    historyCurrent: portfolioHistory?.current === true,
     pendingWork: pendingWork(description!),
     temporalUrl: executionUrl(id),
   };
@@ -140,18 +214,27 @@ app.get<{ Querystring: { account?: string; line?: string } }>('/api/console', as
   const [customers, selected, selectedLine, systems, catalogue] = await Promise.all([
     list(PORTFOLIOS_QUERY, (memo) => {
       const p = memo?.portfolio as PortfolioView | undefined;
-      return p && { accountId: p.accountId, lines: p.lines, lastOrderAt: p.orders.at(-1)?.placedAt };
+      return p && { accountId: p.accountId, lines: p.lines.map(({ undo: _undo, ...rest }) => rest), lastOrderAt: p.orders.at(-1)?.placedAt };
     }),
     account && ACCOUNT_ID.test(account) ? customer(account) : undefined,
     line && LINE_ID.test(line) ? lineDetail(line) : undefined,
     downstream('/admin/state').catch(() => undefined),
     downstream('/admin/routes').catch(() => undefined),
   ]);
+  const routes = (catalogue?.routes ?? []) as Route[];
   return {
     customers: customers.sort((a, b) => (b.lastOrderAt ?? '').localeCompare(a.lastOrderAt ?? '')),
     selected: selected ?? null,
-    line: selectedLine ?? null,
-    routes: (catalogue?.routes ?? []) as Route[],
+    // The route comes from the catalogue by version, rather than from the line's memo: a published
+    // version never changes, so the memo needn't carry a copy.
+    line: selectedLine
+      ? {
+          ...selectedLine,
+          route: routes.find((r) => r.product === selectedLine.product && r.version === selectedLine.routeVersion) ?? null,
+          replacedBy: selectedLine.replacedBy ?? selected?.portfolio.lines.find((l) => l.lineId === selectedLine.lineId)?.replacedBy,
+        }
+      : null,
+    routes,
     downstream: systems ?? null,
     temporalUiUrl,
   };
@@ -178,7 +261,7 @@ app.post<{ Body: { accountId: string; orderId: string; items: OrderItem[]; bundl
       taskQueue,
       args: [{ accountId }],
       workflowIdConflictPolicy: 'USE_EXISTING',
-      memo: { portfolio: { accountId, lines: [], orders: [], timeline: [] } satisfies PortfolioView },
+      memo: { portfolio: { accountId, lines: [], orders: [], rev: 0 } satisfies PortfolioView },
       typedSearchAttributes: [{ key: AccountIdAttribute, value: accountId }],
     });
     try {
@@ -195,23 +278,26 @@ app.post<{ Body: { accountId: string; orderId: string; items: OrderItem[]; bundl
 );
 
 // Stands in for a downstream system's callback (provider, logistics, engineer, partner).
-// Fire-and-forget: the line decides whether the event applies in its current state.
+// Fire-and-forget: the Workflow decides whether the event applies in its current state. That's the
+// line while it's provisioning, and its cease once the line has activated and ended.
 app.post<{ Params: { lineId: string }; Body: { type: EventName } }>('/api/lines/:lineId/events', async (request, reply) => {
   const { lineId } = request.params;
   const type = request.body?.type;
   if (!LINE_ID.test(lineId) || !(type in EVENTS)) {
     return reply.code(400).send({ error: `type must be one of ${Object.keys(EVENTS).join(', ')}` });
   }
-  try {
-    await client.workflow.getHandle(lineWorkflowId(lineId)).signal(lineEventSignal, { type });
-  } catch (err) {
-    if (err instanceof WorkflowNotFoundError) return reply.code(404).send({ error: `line ${lineId} is not running` });
-    throw err;
+  for (const workflowId of [lineWorkflowId(lineId), ceaseWorkflowId(lineId)]) {
+    try {
+      await client.workflow.getHandle(workflowId).signal(lineEventSignal, { type });
+      return reply.code(202).send({ accepted: true, to: workflowId });
+    } catch (err) {
+      if (!(err instanceof WorkflowNotFoundError)) throw err;
+    }
   }
-  return reply.code(202).send({ accepted: true });
+  return reply.code(409).send({ error: `nothing is running for ${lineId}, so no one is waiting for ${type}` });
 });
 
-// Moves a running line onto another version of its route. Returns the line as it is now.
+// Moves a running line onto another version of its route, at its next gate.
 app.post<{ Params: { lineId: string }; Body: { version: number; compensate: boolean } }>('/api/lines/:lineId/route', async (request, reply) => {
   const { lineId } = request.params;
   const { version, compensate } = request.body ?? {};
@@ -219,11 +305,10 @@ app.post<{ Params: { lineId: string }; Body: { version: number; compensate: bool
     return reply.code(400).send({ error: 'expected {version: integer, compensate: boolean}' });
   }
   try {
-    await client.workflow.getHandle(lineWorkflowId(lineId)).executeUpdate(changeRouteUpdate, { args: [{ version, compensate }] });
+    return await client.workflow.getHandle(lineWorkflowId(lineId)).executeUpdate(changeRouteUpdate, { args: [{ version, compensate }] });
   } catch (err) {
     return refused(err, reply);
   }
-  return lineDetail(lineId);
 });
 
 // Publishes a new version of a product's route. Lines already running keep the version they
@@ -252,13 +337,14 @@ app.put<{ Params: { system: string }; Body: { mode: string } }>('/api/downstream
   });
 });
 
-// Back to a clean slate: delete every portfolio and line execution (the server terminates running
+// Back to a clean slate: delete every portfolio, line and cease execution (the server terminates running
 // ones first) and reset the simulated systems, including the catalogue's routes.
 app.post('/api/reset', async () => {
   const executions = [];
   for await (const execution of client.workflow.list({ query: IN_DEMO })) {
     executions.push({ workflowId: execution.workflowId, runId: execution.runId });
   }
+  histories.clear();
   await Promise.all([
     ...executions.map((workflowExecution) =>
       client.workflowService.deleteWorkflowExecution({ namespace, workflowExecution }).catch(() => undefined),

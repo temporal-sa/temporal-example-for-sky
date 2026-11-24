@@ -16,6 +16,7 @@ import type { FulfilmentActivities } from './activities.js';
 import {
   type ActionName,
   type BundleBehaviour,
+  type CeaseInput,
   EVENTS,
   type EventName,
   type LineInput,
@@ -30,15 +31,20 @@ import {
   type RouteStep,
   type RowStatus,
   type TimelineEntry,
+  type UndoPlan,
+  type UndoStep,
+  ceaseWorkflowId,
   lineIdFor,
   lineSummary,
   lineWorkflowId,
+  newCeaseView,
   newLineView,
   portfolioWorkflowId,
 } from './domain.js';
 import {
-  ceaseLineSignal,
+  cancelLineSignal,
   changeRouteUpdate,
+  historyQuery,
   lineChangedSignal,
   lineEventSignal,
   lineReleasedSignal,
@@ -57,32 +63,67 @@ const fulfilment = proxyActivities<FulfilmentActivities>({
 
 const TIMELINE_LIMIT = 60;
 
-function append(timeline: TimelineEntry[], text: string, tone: TimelineEntry['tone'] = 'info'): void {
-  timeline.push({ at: new Date().toISOString(), text, tone });
-  if (timeline.length > TIMELINE_LIMIT) timeline.shift();
+// Each Workflow keeps its own history and serves it to the console through the `history` Query.
+// It stays out of the memo, so a memo write doesn't copy the whole history into the Event History.
+function journal(carried: TimelineEntry[] = []) {
+  const timeline = [...carried];
+  setHandler(historyQuery, () => timeline);
+  return {
+    timeline,
+    record(text: string, tone: TimelineEntry['tone'] = 'info'): void {
+      timeline.push({ at: new Date().toISOString(), text, tone });
+      if (timeline.length > TIMELINE_LIMIT) timeline.shift();
+    },
+  };
+}
+
+// The undo half of each route action, shared by a line cancelled before activation and a cease.
+function undoAction(action: ActionName, ref: string): Promise<string> {
+  switch (action) {
+    case 'provider.ceaseVoiceAndData':
+      return fulfilment.ceaseVoiceAndDataOrder(ref);
+    case 'logistics.recall':
+      return fulfilment.recallKit(ref);
+    case 'engineer.cancelVisit':
+      return fulfilment.cancelEngineerVisit(ref);
+    case 'partner.deactivate':
+      return fulfilment.deactivatePartnerAccount(ref);
+    default:
+      throw ApplicationFailure.nonRetryable(`${action} doesn't undo anything`);
+  }
 }
 
 // =================================================================================================
-// Portfolio: one per customer. Every order for the customer comes through here, so this is where a
-// second order meets the lines the first one is still provisioning.
+// Portfolio: one per customer, for as long as they're a customer. Every order comes through here, so
+// this is where a second order meets the lines the first one is still provisioning. It's the only
+// long-lived Workflow: lines and ceases are bounded runs it starts, and it continues as new when its
+// history gets long.
 // =================================================================================================
 
 type PortfolioWork =
   | { kind: 'order'; order: OrderRecord; lines: PortfolioLine[] }
   | { kind: 'release'; to: string; release: Release }
-  | { kind: 'cease'; lineId: string; reason: string; replaced: boolean };
+  | { kind: 'cease'; lineId: string; reason: string; replacedBy?: string };
 
 const OPEN: LineStatus[] = ['PROVISIONING', 'ACTIVE'];
 
-export async function portfolio(input: { accountId: string; carried?: PortfolioView }): Promise<void> {
+interface PortfolioCarried {
+  view: PortfolioView;
+  timeline: TimelineEntry[];
+}
+
+export async function portfolio(input: { accountId: string; carried?: PortfolioCarried }): Promise<void> {
   const { accountId } = input;
-  const view: PortfolioView = input.carried ?? { accountId, lines: [], orders: [], timeline: [] };
+  const view: PortfolioView = input.carried?.view ?? { accountId, lines: [], orders: [], rev: 0 };
+  const { timeline, record } = journal(input.carried?.timeline);
   const work: PortfolioWork[] = [];
 
   const line = (lineId: string) => view.lines.find((l) => l.lineId === lineId);
   const name = (l: { product: keyof typeof PRODUCTS; lineId: string }) => `${PRODUCTS[l.product].name} (${l.lineId})`;
 
+  // The memo is what the console lists customers from, through List and Describe.
   function publish(): void {
+    view.rev++;
     upsertMemo({ portfolio: view });
   }
 
@@ -127,10 +168,35 @@ export async function portfolio(input: { accountId: string; carried?: PortfolioV
     touched.add(target.lineId);
     if (!OPEN.includes(target.status)) throw new Error(`${target.lineId} is ${target.status.toLowerCase()}`);
     if (target.replacedBy) throw new Error(`${target.lineId} is already being replaced by ${target.replacedBy}`);
-    if (target.ceaseRequested) throw new Error(`${target.lineId} is already being ceased`);
+    if (target.ceaseRequested || target.ceaseStarted) throw new Error(`${target.lineId} is already being ceased`);
     if (target.replaces && target.status === 'PROVISIONING') {
       throw new Error(`${target.lineId} is an upgrade still being provisioned; change it once it's active`);
     }
+  }
+
+  // The portfolio decides what happens to a line once it's live, from what it knows about every
+  // line. These two run whenever that knowledge changes, and each acts at most once per line.
+
+  // A line being replaced that activated first: the replacement crossgrades the live service.
+  function releaseIfDue(old: PortfolioLine): void {
+    if (old.status !== 'ACTIVE' || !old.replacedBy || old.released) return;
+    old.released = true;
+    record(`${name(old)} is live, so ${old.replacedBy} crossgrades it`);
+    work.push({ kind: 'release', to: old.replacedBy, release: { lineId: old.lineId, outcome: 'ACTIVE', migrateFrom: old.providerOrderRef } });
+  }
+
+  // A live line the customer ceased, or whose replacement is now live: start a ceaseLine Workflow.
+  function ceaseIfDue(target: PortfolioLine | undefined): void {
+    if (!target || target.status !== 'ACTIVE' || target.ceaseStarted) return;
+    const replacement = target.replacedBy ? line(target.replacedBy) : undefined;
+    if (target.ceaseRequested) {
+      work.push({ kind: 'cease', lineId: target.lineId, reason: 'the customer ordered a cease' });
+    } else if (replacement?.status === 'ACTIVE') {
+      work.push({ kind: 'cease', lineId: target.lineId, reason: `replaced by ${replacement.lineId}`, replacedBy: replacement.lineId });
+    } else {
+      return;
+    }
+    target.ceaseStarted = true;
   }
 
   setHandler(
@@ -167,8 +233,13 @@ export async function portfolio(input: { accountId: string; carried?: PortfolioV
       const described = request.items.map((item) =>
         item.type === 'CEASE' ? `cease ${item.lineId}` : item.replaces ? `upgrade ${item.replaces} to ${PRODUCTS[item.product].name} (${request.bundleBehaviour})` : `add ${PRODUCTS[item.product].name}`,
       );
-      append(view.timeline, `Order ${request.orderId} placed: ${described.join(', ')}`);
+      record(`Order ${request.orderId} placed: ${described.join(', ')}`);
       work.push({ kind: 'order', order, lines });
+      // Queued after the order, so a replacement exists before it's released.
+      for (const item of request.items) {
+        if (item.type === 'ADD' && item.replaces) releaseIfDue(line(item.replaces)!);
+        if (item.type === 'CEASE') ceaseIfDue(line(item.lineId));
+      }
       publish();
       return view;
     },
@@ -181,32 +252,29 @@ export async function portfolio(input: { accountId: string; carried?: PortfolioV
     const before = known.status;
     // replacedBy is the portfolio's decision; a line only learns it when its Signal arrives.
     Object.assign(known, summary, { replacedBy: summary.replacedBy ?? known.replacedBy });
-    if (before !== summary.status) {
-      append(view.timeline, `${name(known)} is ${summary.status.toLowerCase()}`);
-      // An upgrade of a live line is live now: cease the line it replaces, which stops its billing.
-      const replaced = summary.replaces ? line(summary.replaces) : undefined;
-      if (summary.status === 'ACTIVE' && replaced?.status === 'ACTIVE') {
-        work.push({ kind: 'cease', lineId: replaced.lineId, reason: `replaced by ${summary.lineId}`, replaced: true });
-      }
-    }
+    if (before !== known.status) record(`${name(known)} is ${known.status.toLowerCase()}`);
+    releaseIfDue(known);
+    ceaseIfDue(known);
+    if (known.replaces) ceaseIfDue(line(known.replaces));
     publish();
   });
 
   setHandler(lineReleasedSignal, (release) => {
-    const replacement = line(release.lineId)?.replacedBy;
-    if (!replacement) return;
-    append(view.timeline, `${release.lineId} released for ${replacement} (${release.outcome.toLowerCase()})`);
-    work.push({ kind: 'release', to: replacement, release });
+    const old = line(release.lineId);
+    if (!old?.replacedBy || old.released) return;
+    old.released = true;
+    record(`${release.lineId} released for ${old.replacedBy} (${release.outcome.toLowerCase()})`);
+    work.push({ kind: 'release', to: old.replacedBy, release });
     publish();
   });
 
-  // Signals a line. A line that has already finished can't be signalled; `orElse` decides what that means.
-  async function tell(lineId: string, send: (handle: ReturnType<typeof getExternalWorkflowHandle>) => Promise<void>, orElse: () => void): Promise<void> {
+  // Signals a line that's still provisioning. One that has just finished can't be signalled; that's
+  // fine, because its last report reaches the portfolio first and the portfolio acts on that.
+  async function tell(lineId: string, send: (handle: ReturnType<typeof getExternalWorkflowHandle>) => Promise<void>): Promise<void> {
     try {
       await send(getExternalWorkflowHandle(lineWorkflowId(lineId)));
     } catch (err) {
-      log.warn('line could not be signalled', { line: lineId, error: String(err) });
-      orElse();
+      log.info('line had already finished', { line: lineId, error: String(err) });
     }
   }
 
@@ -221,8 +289,8 @@ export async function portfolio(input: { accountId: string; carried?: PortfolioV
         });
         for (const added of lines) {
           const lineInput: LineInput = { lineId: added.lineId, accountId, orderId: order.orderId, product: added.product, replaces: added.replaces };
-          // ABANDON: a line is the customer's product holding and outlives this run of the portfolio,
-          // which continues as new from time to time.
+          // ABANDON: the line runs until it's active or cancelled, which can outlast this run of the
+          // portfolio when it continues as new.
           await startChild(productLine, {
             workflowId: lineWorkflowId(added.lineId),
             args: [lineInput],
@@ -233,40 +301,48 @@ export async function portfolio(input: { accountId: string; carried?: PortfolioV
               { key: RowStatusAttribute, value: 'BEGIN' },
             ],
           });
-          if (added.replaces) {
-            const replaced = added.replaces;
-            await tell(replaced, (h) => h.signal(replaceLineSignal, { byLineId: added.lineId, bundleBehaviour: order.bundleBehaviour as BundleBehaviour }), () =>
-              // The old line finished before it heard about the upgrade, so there is nothing to hand over.
-              work.push({ kind: 'release', to: added.lineId, release: { lineId: replaced, outcome: 'CANCELLED' } }),
-            );
+          const old = added.replaces ? line(added.replaces)! : undefined;
+          if (old?.status === 'PROVISIONING') {
+            await tell(old.lineId, (h) => h.signal(replaceLineSignal, { byLineId: added.lineId, bundleBehaviour: order.bundleBehaviour as BundleBehaviour }));
           }
         }
         for (const item of order.items) {
-          if (item.type === 'CEASE') {
-            await tell(item.lineId, (h) => h.signal(ceaseLineSignal, { reason: `cancelled by order ${order.orderId}` }), () =>
-              append(view.timeline, `${item.lineId} had already finished; nothing to cease`),
-            );
+          if (item.type === 'CEASE' && line(item.lineId)?.status === 'PROVISIONING') {
+            await tell(item.lineId, (h) => h.signal(cancelLineSignal, { reason: `cancelled by order ${order.orderId}` }));
           }
         }
         return;
       }
       case 'release':
-        await tell(job.to, (h) => h.signal(releaseLineSignal, job.release), () => undefined);
+        await tell(job.to, (h) => h.signal(releaseLineSignal, job.release));
         return;
-      case 'cease':
-        await tell(job.lineId, (h) => h.signal(ceaseLineSignal, { reason: job.reason, replaced: job.replaced }), () => undefined);
+      case 'cease': {
+        const target = line(job.lineId)!;
+        const ceaseInput: CeaseInput = { line: { ...lineSummary(target), accountId }, reason: job.reason, replacedBy: job.replacedBy };
+        await startChild(ceaseLine, {
+          workflowId: ceaseWorkflowId(job.lineId),
+          args: [ceaseInput],
+          parentClosePolicy: 'ABANDON',
+          memo: { cease: newCeaseView(ceaseInput) },
+          typedSearchAttributes: [
+            { key: AccountIdAttribute, value: accountId },
+            { key: RowStatusAttribute, value: target.rowStatus },
+          ],
+        });
+        record(`Ceasing ${name(target)}: ${job.reason}`);
         return;
+      }
     }
   }
 
   publish();
-  // The portfolio lives as long as the customer. It acts on one piece of work at a time, in the
-  // order it arrived, and continues as new when its history gets long.
+  // One piece of work at a time, in the order it arrived. Continues as new when the history gets
+  // long, once no handler is running and nothing is queued.
   for (;;) {
     await condition(() => work.length > 0 || workflowInfo().continueAsNewSuggested);
     if (work.length === 0) {
       await condition(allHandlersFinished);
-      if (work.length === 0) await continueAsNew<typeof portfolio>({ accountId, carried: view });
+      if (work.length === 0) await continueAsNew<typeof portfolio>({ accountId, carried: { view, timeline } });
       continue;
     }
     await carryOut(work.shift()!);
@@ -275,38 +351,39 @@ export async function portfolio(input: { accountId: string; carried?: PortfolioV
 }
 
 // =================================================================================================
-// Product line: one per product the customer holds. It runs the route the product catalogue gave
-// it when it started, and stays running while the product is active, until it's ceased.
+// Product line: one per product on an order. It runs the route the product catalogue gave it when it
+// started, and ends when the line is active (AC), cancelled (CN) or migrated to its replacement. So
+// it runs for days or weeks, not for as long as the customer keeps the product.
 // =================================================================================================
 
-type Ending =
-  | { kind: 'replace'; byLineId: string; bundleBehaviour: BundleBehaviour }
-  | { kind: 'cease'; reason: string; replaced: boolean };
+type Ending = { kind: 'replace'; byLineId: string; bundleBehaviour: BundleBehaviour } | { kind: 'cancel'; reason: string };
 
 export async function productLine(input: LineInput): Promise<LineStatus> {
   const { lineId, accountId, product } = input;
   const view = newLineView(input);
+  const { record } = journal();
   const portfolioHandle = getExternalWorkflowHandle(portfolioWorkflowId(accountId));
 
+  let route: Route | undefined;
   const received = new Set<EventName>(); // events that have arrived and count
   const undoWaits = new Set<EventName>(); // events an undo is waiting for
   const performed = new Set<string>(); // steps whose action has run
   const refs: Record<string, string> = {}; // each step's reference in the system it called
   let migrateFrom: string | undefined;
   let ending: Ending | undefined;
+  let activated = false;
   let release: Release | undefined;
   let routeChange: { route: Route; compensate: boolean } | undefined;
-  let releaseWhileActive = false;
   let lastSummary = '';
 
-  const steps = (): RouteStep[] => view.route?.stages.flatMap((stage) => stage.steps) ?? [];
-  const record = (text: string, tone?: TimelineEntry['tone']) => append(view.timeline, text, tone);
+  const steps = (): RouteStep[] => route?.stages.flatMap((stage) => stage.steps) ?? [];
   const interrupted = () => ending !== undefined || routeChange !== undefined;
 
   // Writes the view to the memo, which the console reads with Describe and List.
   function show(): void {
     const awaiting = steps().filter((s) => view.steps[s.id] === 'waiting' && s.waitFor).map((s) => s.waitFor!);
     view.awaiting = [...new Set([...awaiting, ...undoWaits])];
+    view.rev++;
     upsertMemo({ line: view });
     upsertSearchAttributes([{ key: RowStatusAttribute, value: view.rowStatus }]);
   }
@@ -339,7 +416,7 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
   function expects(type: EventName): boolean {
     if (received.has(type)) return false;
     if (undoWaits.has(type)) return true;
-    return view.status === 'PROVISIONING' && !ending && steps().some((s) => s.waitFor === type && !['done', 'dropped'].includes(view.steps[s.id]));
+    return !ending && steps().some((s) => s.waitFor === type && !['done', 'dropped'].includes(view.steps[s.id]));
   }
 
   setHandler(lineEventSignal, ({ type }) => {
@@ -352,28 +429,27 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
     show();
   });
 
-  // Signals are handled one at a time in the order they arrive. If activation arrives first, the
-  // line is live and the upgrade crossgrades it; if the upgrade arrives first, a late activation is
-  // only logged. There is no window where both apply.
+  // Signals are handled one at a time in the order they arrive. If the upgrade arrives first, the
+  // line is cancelled or migrated and a late activation is only logged. If activation arrives first,
+  // the line activates and the portfolio, which hears of it, crossgrades the live line instead.
   setHandler(replaceLineSignal, (request) => {
-    if (ending || view.replacedBy || !['PROVISIONING', 'ACTIVE'].includes(view.status)) {
-      record(`Replacement by ${request.byLineId} received while ${view.status.toLowerCase()}: ignored`, 'ignored');
-      return show();
-    }
     view.replacedBy = request.byLineId;
-    if (view.status === 'ACTIVE') releaseWhileActive = true;
-    else ending = { kind: 'replace', ...request };
-    record(`Replaced by ${request.byLineId} (${request.bundleBehaviour})`);
+    if (activated || ending) {
+      record(`Replacement by ${request.byLineId} arrived after activation: the portfolio crossgrades the live line`);
+    } else {
+      ending = { kind: 'replace', ...request };
+      record(`Replaced by ${request.byLineId} (${request.bundleBehaviour})`);
+    }
     show();
   });
 
-  setHandler(ceaseLineSignal, ({ reason, replaced }) => {
-    if (ending || !['PROVISIONING', 'ACTIVE'].includes(view.status)) {
-      record(`Cease (${reason}) received while ${view.status.toLowerCase()}: ignored`, 'ignored');
-      return show();
+  setHandler(cancelLineSignal, ({ reason }) => {
+    if (activated || ending) {
+      record(`Cancellation (${reason}) arrived after activation: the portfolio ceases the live line`);
+    } else {
+      ending = { kind: 'cancel', reason };
+      record(`Cancellation requested: ${reason}`);
     }
-    ending = { kind: 'cease', reason, replaced: replaced ?? false };
-    record(`Cease requested: ${reason}`);
     show();
   });
 
@@ -388,21 +464,21 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
   setHandler(
     changeRouteUpdate,
     async ({ version, compensate }) => {
-      const route = await fulfilment.loadRoute(product, version);
+      const next = await fulfilment.loadRoute(product, version);
       const accepted = steps().find((s) => s.accepted);
-      if (accepted && performed.has(accepted.id) && !route.stages.some((stage) => stage.steps.some((s) => s.id === accepted.id))) {
+      if (accepted && performed.has(accepted.id) && !next.stages.some((stage) => stage.steps.some((s) => s.id === accepted.id))) {
         throw ApplicationFailure.nonRetryable(`v${version} has no step "${accepted.id}", which has already been accepted downstream`);
       }
-      if (ending || routeChange) throw ApplicationFailure.nonRetryable('the line changed while the route was loading; try again');
-      routeChange = { route, compensate };
+      if (ending || routeChange || activated) throw ApplicationFailure.nonRetryable('the line changed while the route was loading; try again');
+      routeChange = { route: next, compensate };
       record(`Moving to route v${version} at the next gate${compensate ? ', undoing steps v' + version + ' removes' : ''}`);
       show();
       return { version };
     },
     {
       validator: ({ version }) => {
-        if (view.status !== 'PROVISIONING' || ending) throw new Error(`${lineId} is ${view.status.toLowerCase()}; only a line being provisioned can change route`);
-        if (!view.route) throw new Error(`${lineId} hasn't loaded its route yet`);
+        if (activated || ending) throw new Error(`${lineId} is ${activated ? 'active' : 'being cancelled'}; only a line being provisioned can change route`);
+        if (!route) throw new Error(`${lineId} hasn't loaded its route yet`);
         if (version === view.routeVersion) throw new Error(`${lineId} is already on v${version}`);
         if (routeChange) throw new Error(`${lineId} is already moving to v${routeChange.route.version}`);
       },
@@ -416,27 +492,21 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
     await publish();
   }
 
-  // Each route action is an Activity. Undo actions get the reference the forward action returned.
-  async function perform(action: ActionName, step: RouteStep, ref?: string): Promise<string> {
+  // Each forward route action is an Activity.
+  async function perform(action: ActionName, step: RouteStep): Promise<string> {
     const params = step.params ?? {};
     switch (action) {
       case 'provider.submitVoiceAndData':
         view.providerOrderRef = await fulfilment.submitVoiceAndDataOrder({ lineId, accountId, product, migrateFrom });
         return view.providerOrderRef;
-      case 'provider.ceaseVoiceAndData':
-        return fulfilment.ceaseVoiceAndDataOrder(ref!);
       case 'logistics.dispatch':
         return fulfilment.dispatchKit({ lineId, stepId: step.id, item: params.item ?? step.name });
-      case 'logistics.recall':
-        return fulfilment.recallKit(ref!);
       case 'engineer.bookVisit':
         return fulfilment.bookEngineerVisit({ lineId, stepId: step.id, job: params.job ?? step.name });
-      case 'engineer.cancelVisit':
-        return fulfilment.cancelEngineerVisit(ref!);
       case 'partner.activate':
         return fulfilment.activatePartnerAccount({ lineId, partner: params.partner ?? 'Partner' });
-      case 'partner.deactivate':
-        return fulfilment.deactivatePartnerAccount(ref!);
+      default:
+        throw ApplicationFailure.nonRetryable(`${action} isn't a forward action`);
     }
   }
 
@@ -466,17 +536,17 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
     }
   }
 
-  // Stages run in order and the steps in a stage run together. Returns true once every step is done,
-  // false if the line is cancelled or replaced first. A route change restarts from the first stage
-  // with work left, skipping what's done.
+  // Stages run in order and the steps in a stage run together. Returns true once every step is done
+  // (activated, even if an upgrade or cancellation arrived in the same moment), false if the line is
+  // cancelled or replaced first. A route change restarts from the first stage with work left.
   async function runRoute(): Promise<boolean> {
     for (;;) {
-      for (const stage of view.route!.stages) {
+      for (const stage of route!.stages) {
         await Promise.all(stage.steps.map(runStep));
         if (interrupted()) break;
       }
+      if (steps().every((s) => view.steps[s.id] === 'done')) return true;
       if (ending) return false;
-      if (!routeChange) return true;
       await adoptRoute();
     }
   }
@@ -485,7 +555,7 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
     const undo = step.undo!;
     view.steps[step.id] = 'undoing';
     await publish();
-    await perform(undo.action, step, refs[step.id]);
+    await undoAction(undo.action, refs[step.id]);
     if (undo.waitFor) {
       undoWaits.add(undo.waitFor);
       await publish(`Waiting for ${undo.waitFor}`);
@@ -497,14 +567,14 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
     await publish();
   }
 
-  // Undoes completed steps, last stage first: a cancellation before activation, or a cease.
+  // Undoes completed steps, last stage first: a cancellation before activation.
   async function undoPerformed(phase: string): Promise<void> {
     for (const step of steps()) {
       if (!performed.has(step.id) && view.steps[step.id] !== 'done') view.steps[step.id] = 'dropped';
       else if (!step.undo && view.steps[step.id] === 'waiting') view.steps[step.id] = 'dropped';
     }
     await publish(phase);
-    for (const stage of [...view.route!.stages].reverse()) {
+    for (const stage of [...route!.stages].reverse()) {
       await Promise.all(stage.steps.filter((s) => performed.has(s.id) && s.undo).map(undoStep));
     }
   }
@@ -524,11 +594,22 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
     await Promise.all(toUndo.map(undoStep));
     view.retired.push(...removed.map((s) => ({ id: s.id, name: s.name, fromVersion, state: view.steps[s.id] })));
     for (const step of removed) delete view.steps[step.id];
-    view.route = next;
+    route = next;
     view.routeVersion = next.version;
     for (const step of steps()) view.steps[step.id] ??= 'pending';
     record(`Moved from route v${fromVersion} to v${next.version}`);
     await publish(progress());
+  }
+
+  // What a cease would have to reverse, handed to the portfolio when the line activates.
+  function undoPlan(): UndoPlan {
+    return route!.stages
+      .map((stage) =>
+        stage.steps
+          .filter((s) => performed.has(s.id) && s.undo)
+          .map((s): UndoStep => ({ stepId: s.id, name: s.name, action: s.undo!.action, ref: refs[s.id], waitFor: s.undo!.waitFor })),
+      )
+      .filter((stage) => stage.length > 0);
   }
 
   async function released(outcome: Release['outcome'], ref?: string): Promise<void> {
@@ -542,8 +623,8 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
   // --- The line's lifecycle ------------------------------------------------------------------------
 
   // Loaded once and recorded in history: the line keeps this version unless an operator moves it.
-  view.route = await fulfilment.loadRoute(product);
-  view.routeVersion = view.route.version;
+  route = await fulfilment.loadRoute(product);
+  view.routeVersion = route.version;
   for (const step of steps()) view.steps[step.id] = 'pending';
   record(`Route ${PRODUCTS[product].name} v${view.routeVersion} loaded from the product catalogue`);
   await publish();
@@ -555,72 +636,130 @@ export async function productLine(input: LineInput): Promise<LineStatus> {
     migrateFrom = release?.migrateFrom;
   }
 
-  let activated = false;
   if (!ending) {
     await setRow('RQ', input.replaces ? 'CUSTOMER_REQUESTED_CROSSGRADE_RECEIVED' : 'START');
     activated = await runRoute();
   }
 
-  if (!activated) {
-    const e = ending!;
-    if (e.kind === 'replace' && e.bundleBehaviour === 'PROVIDE' && view.providerOrderRef) {
-      // PROVIDE: one migrate order at the provider replaces this one. The row stays AP with a
-      // CROSSGRADE cease, as the scenario shows, and nothing is undone.
-      for (const step of steps()) if (view.steps[step.id] !== 'done') view.steps[step.id] = 'dropped';
-      await fulfilment.logPortfolioRowEvent(lineId, `CEASE (CROSSGRADE): provider order ${view.providerOrderRef} migrates to ${e.byLineId}`);
-      view.status = 'MIGRATED';
-      record(`Provider order ${view.providerOrderRef} handed to ${e.byLineId}; row stays AP with a CROSSGRADE cease`);
-      await publish('Migrated to its replacement');
-      await released('MIGRATED', view.providerOrderRef);
-    } else {
-      // REVERT, or a cancellation: undo what was done, AP -> PAX -> CN.
-      const why = e.kind === 'replace' ? `replaced by ${e.byLineId}` : e.reason;
-      if (view.rowStatus === 'AP') await setRow('PAX', 'CUSTOMER_REQUESTED_PREACTIVE_CEASE');
-      await undoPerformed(`Cancelling: ${why}`);
-      await setRow('CN', e.kind === 'replace' ? 'CROSSGRADE_CANCELLED' : 'CUSTOMER_CANCELLED');
-      view.status = 'CANCELLED';
-      record(`Cancelled before activation (${why})`);
-      await publish('Cancelled before activation');
-      if (e.kind === 'replace') await released('CANCELLED');
-    }
-  } else {
-    // Activation won any race with an upgrade: the upgrade now crossgrades the live service.
-    if (ending?.kind === 'replace') {
-      ending = undefined;
-      releaseWhileActive = true;
-    }
+  if (activated) {
+    // An upgrade or cancellation that arrived as the last gate passed is the portfolio's to act on
+    // now: it crossgrades or ceases the live line.
+    if (ending) record(`${ending.kind === 'replace' ? 'The replacement' : 'The cancellation'} arrived as the last gate passed: the portfolio acts on the live line`);
+    ending = undefined;
     await publish('Activated: moving the row to AC and starting billing');
     await setRow('AC', 'ACTIVATED');
     // Billing starts only now, so the customer never pays for a line that isn't provisioned.
     await fulfilment.startBilling({ lineId, accountId, product });
     view.billing.since = new Date().toISOString();
     view.status = 'ACTIVE';
-    record('Active; billing started');
+    view.undo = undoPlan();
+    record('Active; billing started. Provisioning is done, so this Workflow ends here');
     await publish('Active and billing');
-
-    // The product holding stays here while it's live, until it's ceased. An upgrade of a live line
-    // keeps this one billing until the upgrade activates; then the portfolio ceases it.
-    for (;;) {
-      await condition(() => releaseWhileActive || ending !== undefined);
-      if (!releaseWhileActive) break;
-      releaseWhileActive = false;
-      await publish(`Active and billing until ${view.replacedBy} activates`);
-      await released('ACTIVE', view.providerOrderRef);
-    }
-    const cease = ending as Extract<Ending, { kind: 'cease' }>;
-    await fulfilment.stopBilling(lineId);
-    view.billing.until = new Date().toISOString();
-    record('Billing stopped');
-    if (cease.replaced) {
-      await fulfilment.logPortfolioRowEvent(lineId, `CEASE (CROSSGRADE): service migrated to ${view.replacedBy}`);
-    } else {
-      await undoPerformed(`Ceasing: ${cease.reason}`);
-    }
-    await setRow('CE', cease.replaced ? 'CROSSGRADE_COMPLETED' : 'CUSTOMER_REQUESTED_CEASE');
-    view.status = 'CEASED';
-    await publish(cease.replaced ? `Ceased: replaced by ${view.replacedBy}` : 'Ceased');
+  } else if (ending!.kind === 'replace' && ending!.bundleBehaviour === 'PROVIDE' && view.providerOrderRef) {
+    // PROVIDE: one migrate order at the provider replaces this one. The row stays AP with a
+    // CROSSGRADE cease, as the scenario shows, and nothing is undone.
+    const byLineId = ending!.byLineId;
+    for (const step of steps()) if (view.steps[step.id] !== 'done') view.steps[step.id] = 'dropped';
+    await fulfilment.logPortfolioRowEvent(lineId, `CEASE (CROSSGRADE): provider order ${view.providerOrderRef} migrates to ${byLineId}`);
+    view.status = 'MIGRATED';
+    record(`Provider order ${view.providerOrderRef} handed to ${byLineId}; row stays AP with a CROSSGRADE cease`);
+    await publish('Migrated to its replacement');
+    await released('MIGRATED', view.providerOrderRef);
+  } else {
+    // REVERT, or a cancellation: undo what was done, AP -> PAX -> CN.
+    const e = ending!;
+    const why = e.kind === 'replace' ? `replaced by ${e.byLineId}` : e.reason;
+    if (view.rowStatus === 'AP') await setRow('PAX', 'CUSTOMER_REQUESTED_PREACTIVE_CEASE');
+    await undoPerformed(`Cancelling: ${why}`);
+    await setRow('CN', e.kind === 'replace' ? 'CROSSGRADE_CANCELLED' : 'CUSTOMER_CANCELLED');
+    view.status = 'CANCELLED';
+    record(`Cancelled before activation (${why})`);
+    await publish('Cancelled before activation');
+    if (e.kind === 'replace') await released('CANCELLED');
   }
 
   await condition(allHandlersFinished);
   return view.status;
+}
+
+// =================================================================================================
+// Cease: one per live line the portfolio ceases, because the customer asked or because its
+// replacement is live. It stops billing, undoes what the line set up (unless the service migrated to
+// the replacement), and moves the row to CE. It runs for as long as the provider takes to confirm.
+// =================================================================================================
+
+export async function ceaseLine(input: CeaseInput): Promise<LineStatus> {
+  const { line, reason, replacedBy } = input;
+  const { lineId, accountId } = line;
+  const view = newCeaseView(input);
+  const { record } = journal();
+  const received = new Set<EventName>();
+
+  function show(phase?: string): void {
+    if (phase) view.phase = phase;
+    view.rev++;
+    upsertMemo({ cease: view });
+    upsertSearchAttributes([{ key: RowStatusAttribute, value: view.rowStatus }]);
+  }
+
+  async function report(status: LineStatus): Promise<void> {
+    const { accountId: _, ...summary } = line;
+    try {
+      await getExternalWorkflowHandle(portfolioWorkflowId(accountId)).signal(lineChangedSignal, { ...summary, status, rowStatus: view.rowStatus, billing: view.billing });
+    } catch (err) {
+      log.warn('portfolio could not be signalled', { error: String(err) });
+    }
+  }
+
+  setHandler(lineEventSignal, ({ type }) => {
+    if (view.awaiting.includes(type) && !received.has(type)) {
+      received.add(type);
+      record(`${type} received from ${EVENTS[type]}`);
+    } else {
+      record(`${type} received while ceasing: no transition, only logged`, 'ignored');
+    }
+    show();
+  });
+
+  async function undo(step: UndoStep): Promise<void> {
+    const state = view.steps.find((s) => s.stepId === step.stepId)!;
+    state.state = 'undoing';
+    show();
+    await undoAction(step.action, step.ref);
+    if (step.waitFor) {
+      view.awaiting.push(step.waitFor);
+      show(`Waiting for ${step.waitFor}`);
+      await condition(() => received.has(step.waitFor!));
+      view.awaiting = view.awaiting.filter((e) => e !== step.waitFor);
+    }
+    state.state = 'undone';
+    record(`${step.name}: undone`);
+    show();
+  }
+
+  record(`Ceasing ${lineId}: ${reason}`);
+  show('Stopping billing');
+  await fulfilment.stopBilling(lineId);
+  view.billing = { ...view.billing, until: new Date().toISOString() };
+  record('Billing stopped');
+  show();
+  await report('ACTIVE');
+
+  if (replacedBy) {
+    await fulfilment.logPortfolioRowEvent(lineId, `CEASE (CROSSGRADE): service migrated to ${replacedBy}`);
+    record(`Service migrated to ${replacedBy}; nothing to undo`);
+  } else {
+    show('Undoing what the line set up');
+    for (const stage of [...(line.undo ?? [])].reverse()) await Promise.all(stage.map(undo));
+  }
+
+  await fulfilment.setPortfolioRowStatus(lineId, 'CE', replacedBy ? 'CROSSGRADE_COMPLETED' : 'CUSTOMER_REQUESTED_CEASE');
+  view.rowStatus = 'CE';
+  view.status = 'CEASED';
+  record('Portfolio row CE');
+  show(replacedBy ? `Ceased: replaced by ${replacedBy}` : 'Ceased');
+  await report('CEASED');
+
+  await condition(allHandlersFinished);
+  return 'CEASED';
 }

@@ -5,8 +5,8 @@ import {
   EVENT_NAMES,
   type EventName,
   type LineDetail as Detail,
-  type LineSummary,
   PRODUCTS,
+  type PortfolioLine,
   type ProductCode,
   type Route,
   type RowStatus,
@@ -17,7 +17,7 @@ import { ROW_LABELS, STEP_STATUS, StatusBadge, billingText, lineStatus, time } f
 
 interface Props {
   line: Detail;
-  lines: (LineSummary & { ceaseRequested?: boolean })[];
+  lines: PortfolioLine[];
   routes: Route[];
   onSelectLine: (lineId: string) => void;
   onChanged: () => void;
@@ -45,7 +45,11 @@ export function LineDetail({ line, lines, routes, onSelectLine, onChanged, onErr
   const open = line.status === 'PROVISIONING' || line.status === 'ACTIVE';
   const portfolioLine = lines.find((l) => l.lineId === line.lineId);
   // The same rules the portfolio's validator applies; it has the final say.
-  const changeable = open && !line.replacedBy && !portfolioLine?.ceaseRequested && !(line.replaces && line.status === 'PROVISIONING');
+  const changeable =
+    open && !line.cease && !line.replacedBy && !portfolioLine?.ceaseRequested && !portfolioLine?.ceaseStarted && !(line.replaces && line.status === 'PROVISIONING');
+  // Callbacks go to whichever Workflow is running for the line: the line while it's provisioning,
+  // then its cease.
+  const listening = line.status === 'PROVISIONING' || line.cease?.status === 'CEASING';
 
   return (
     <div className="line-detail">
@@ -69,8 +73,13 @@ export function LineDetail({ line, lines, routes, onSelectLine, onChanged, onErr
         <div className="detail-head-side">
           <StatusBadge status={status} label={label} code={line.rowStatus} />
           <a className="link small" href={line.temporalUrl} target="_blank" rel="noreferrer">
-            Open in Temporal UI ↗
+            Open line in Temporal UI ↗
           </a>
+          {line.ceaseTemporalUrl && (
+            <a className="link small" href={line.ceaseTemporalUrl} target="_blank" rel="noreferrer">
+              Open cease in Temporal UI ↗
+            </a>
+          )}
         </div>
       </div>
 
@@ -113,7 +122,15 @@ export function LineDetail({ line, lines, routes, onSelectLine, onChanged, onErr
       <div className="now">
         <span className="eyebrow">Now</span>
         <p>{line.phase}</p>
+        {line.status === 'ACTIVE' && !line.cease && (
+          <p className="small subtle">
+            Provisioning is done, so this line's Workflow has completed. The portfolio holds the live line: a cease or an upgrade starts new
+            Workflows from there.
+          </p>
+        )}
       </div>
+
+      {line.cease && <Cease cease={line.cease} />}
 
       {line.route ? (
         <section aria-labelledby="route-progress-heading">
@@ -141,7 +158,7 @@ export function LineDetail({ line, lines, routes, onSelectLine, onChanged, onErr
         <p className="subtle">Waiting for a Worker to load the route.</p>
       )}
 
-      {(open || line.awaiting.length > 0) && <Callbacks line={line} onChanged={onChanged} onError={onError} />}
+      {listening && <Callbacks line={line} onChanged={onChanged} onError={onError} />}
 
       {line.status === 'PROVISIONING' && line.route && !line.replacedBy && !portfolioLine?.ceaseRequested && line.rowStatus !== 'PAX' && <MoveRoute line={line} routes={routes} onChanged={onChanged} />}
 
@@ -149,9 +166,46 @@ export function LineDetail({ line, lines, routes, onSelectLine, onChanged, onErr
 
       <section aria-labelledby="line-history-heading">
         <h3 id="line-history-heading">History</h3>
+        <HistoryNote current={line.historyCurrent} empty={line.timeline.length === 0} />
         <Timeline entries={line.timeline} />
       </section>
     </div>
+  );
+}
+
+// History comes from a Query, which needs a Worker. Everything else on the page comes from the
+// memo and keeps updating while the Worker is down.
+export function HistoryNote({ current, empty }: { current: boolean; empty: boolean }) {
+  if (current) return null;
+  return (
+    <p className="small subtle" role="status">
+      {empty ? 'History needs a running Worker to answer its Query. It appears once one is back.' : 'No Worker is answering, so this is the history as of the last time one did.'}
+    </p>
+  );
+}
+
+// The cease of a live line: its own Workflow, started by the portfolio after the line's has ended.
+function Cease({ cease }: { cease: NonNullable<Detail['cease']> }) {
+  return (
+    <section className="card" aria-labelledby="cease-heading">
+      <div className="card-head">
+        <h3 id="cease-heading">Cease</h3>
+        <span className="subtle small">A ceaseLine Workflow, started by the portfolio: {cease.reason}</span>
+      </div>
+      {cease.replacedBy ? (
+        <p className="small">The service migrated to {cease.replacedBy}, so billing stops and nothing is undone downstream.</p>
+      ) : cease.steps.length === 0 ? (
+        <p className="small">Nothing to undo; billing stops.</p>
+      ) : (
+        <ul className="cease-steps">
+          {cease.steps.map((step) => (
+            <li key={step.stepId}>
+              <span className="small">Undo {step.name}</span> <StatusBadge {...STEP_STATUS[step.state]} label={step.state === 'pending' ? 'Not started' : STEP_STATUS[step.state].label} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 
@@ -376,7 +430,9 @@ function CustomerChange({ line, onChanged, onSelectLine }: { line: Detail; onCha
       {mode === 'upgrade' && (
         <fieldset className="choices">
           <legend className="small">
-            {active ? 'This line is active: the upgrade crossgrades the live service, and this line bills until the upgrade activates.' : 'What happens to this line, which is still being provisioned:'}
+            {active
+              ? 'This line is active: the upgrade crossgrades the live service. This line bills until the upgrade activates; then the portfolio ceases it.'
+              : 'What happens to this line, which is still being provisioned:'}
           </legend>
           {!active && (
             <>
@@ -400,7 +456,9 @@ function CustomerChange({ line, onChanged, onSelectLine }: { line: Detail; onCha
       )}
       {mode === 'cease' && (
         <p className="small">
-          {active ? 'Billing stops, and each completed step is undone.' : 'Each completed step is undone (AP → PAX → CN). The customer\'s other lines carry on.'}
+          {active
+            ? 'The portfolio starts a cease Workflow: billing stops, then each completed step is undone (AC → CE).'
+            : "Each completed step is undone (AP → PAX → CN). The customer's other lines carry on."}
         </p>
       )}
       {refusal && (

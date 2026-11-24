@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FulfilmentActivities } from './activities.js';
 import {
   type BundleBehaviour,
+  type CeaseView,
   type EventName,
   type LineView,
   type OrderItem,
@@ -16,10 +17,11 @@ import {
   type ProductCode,
   type Route,
   type RowStatus,
+  ceaseWorkflowId,
   lineWorkflowId,
   portfolioWorkflowId,
 } from './domain.js';
-import { changeRouteUpdate, lineEventSignal, placeOrderUpdate } from './messages.js';
+import { changeRouteUpdate, historyQuery, lineEventSignal, placeOrderUpdate } from './messages.js';
 import type { portfolio } from './workflows.js';
 
 const taskQueue = `test-${randomBytes(4).toString('hex')}`;
@@ -182,29 +184,41 @@ async function refusal(promise: Promise<unknown>): Promise<string> {
   return (err as WorkflowUpdateFailedError).cause?.message ?? '';
 }
 
-async function line(lineId: string): Promise<LineView | undefined> {
+async function memo<T>(workflowId: string, key: string): Promise<T | undefined> {
   try {
-    return (await env.client.workflow.getHandle(lineWorkflowId(lineId)).describe()).memo?.line as LineView | undefined;
+    return (await env.client.workflow.getHandle(workflowId).describe()).memo?.[key] as T | undefined;
   } catch {
     return undefined; // not started yet
   }
 }
 
-// Polls the line's memo until the check passes; the memo is what the console reads.
-async function until(lineId: string, check: (view: LineView) => boolean, what: string): Promise<LineView> {
+const line = (lineId: string) => memo<LineView>(lineWorkflowId(lineId), 'line');
+const cease = (lineId: string) => memo<CeaseView>(ceaseWorkflowId(lineId), 'cease');
+
+// Polls a memo until the check passes; the memo is what the console reads.
+async function poll<T>(read: () => Promise<T | undefined>, check: (view: T) => boolean, what: string): Promise<T> {
   const deadline = Date.now() + 20_000;
   for (;;) {
-    const view = await line(lineId);
+    const view = await read();
     if (view && check(view)) return view;
-    if (Date.now() > deadline) throw new Error(`${lineId} never became ${what}; last seen: ${JSON.stringify(view && { status: view.status, row: view.rowStatus, phase: view.phase, steps: view.steps })}`);
+    if (Date.now() > deadline) throw new Error(`never became ${what}; last seen: ${JSON.stringify(view)}`);
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
 }
+
+const until = (lineId: string, check: (view: LineView) => boolean, what: string) => poll(() => line(lineId), check, `${lineId} ${what}`);
+const untilCease = (lineId: string, check: (view: CeaseView) => boolean, what: string) => poll(() => cease(lineId), check, `cease of ${lineId} ${what}`);
+
+const historyOf = (workflowId: string) => env.client.workflow.getHandle(workflowId).query(historyQuery);
 
 const waitingFor = (event: EventName) => (view: LineView) => view.awaiting.includes(event);
 
 async function send(lineId: string, ...events: EventName[]): Promise<void> {
   for (const type of events) await env.client.workflow.getHandle(lineWorkflowId(lineId)).signal(lineEventSignal, { type });
+}
+
+async function sendToCease(lineId: string, type: EventName): Promise<void> {
+  await env.client.workflow.getHandle(ceaseWorkflowId(lineId)).signal(lineEventSignal, { type });
 }
 
 async function activeSuperfast(accountId: string): Promise<string> {
@@ -236,8 +250,7 @@ describe('a multi-product order', () => {
     const [broadband, tv, netflix] = view.lines.map((l) => l.lineId);
 
     // The provider order and the hub run in parallel; both gates must pass before activation.
-    const waiting = await until(broadband, waitingFor('KIT_DELIVERED'), 'waiting for its hub');
-    expect(waiting.rowStatus).toBe('AP');
+    const waiting = await until(broadband, (v) => v.rowStatus === 'AP' && waitingFor('KIT_DELIVERED')(v), 'accepted and waiting for its hub');
     expect(waiting.routeVersion).toBe(1);
 
     // Activation arrives before the hub: it's kept, and counts once the hub is delivered.
@@ -253,6 +266,9 @@ describe('a multi-product order', () => {
     await until(broadband, (v) => v.status === 'ACTIVE', 'active');
     expect(rowMoves.get(broadband)).toEqual(['RQ', 'AP', 'AC']);
     for (const id of [broadband, tv, netflix]) expect(billing.get(id)).toBe('BILLING');
+
+    // Provisioning is done, so the line's Workflow has ended; the portfolio holds the live line.
+    expect(await env.client.workflow.getHandle(lineWorkflowId(broadband)).result()).toBe('ACTIVE');
   });
 });
 
@@ -336,10 +352,13 @@ describe('the race between activation and an upgrade', () => {
     expect((await line(original))!.status).toBe('ACTIVE');
     expect(billing.get(original)).toBe('BILLING');
 
+    // Once the upgrade is live, the portfolio starts a cease for the original: billing stops and
+    // nothing is undone, because the service migrated.
     await finishFibrePro(upgrade);
-    const ceased = await until(original, (v) => v.status === 'CEASED', 'ceased');
+    const ceased = await untilCease(original, (v) => v.status === 'CEASED', 'ceased');
+    expect(ceased.replacedBy).toBe(upgrade);
     expect(billing.get(original)).toBe('STOPPED');
-    expect(ceased.rowStatus).toBe('CE');
+    expect(rowMoves.get(original)).toEqual(['RQ', 'AP', 'AC', 'CE']);
     expect(calls).not.toContain(`cease SNS-${original}`); // migrated, not given up
   });
 
@@ -352,9 +371,9 @@ describe('the race between activation and an upgrade', () => {
     await until(original, (v) => v.rowStatus === 'PAX', 'PAX');
 
     await send(original, 'VOICE_AND_DATA_ORDER_COMPLETED');
-    const view = await until(original, (v) => v.timeline.some((e) => e.tone === 'ignored'), 'logged');
-    expect(view.timeline.find((e) => e.tone === 'ignored')!.text).toBe('VOICE_AND_DATA_ORDER_COMPLETED received in PAX: no transition, only logged');
-    expect(view.status).toBe('PROVISIONING');
+    const logged = await poll(() => historyOf(lineWorkflowId(original)), (h) => h.some((e) => e.tone === 'ignored'), 'logged');
+    expect(logged.find((e) => e.tone === 'ignored')!.text).toBe('VOICE_AND_DATA_ORDER_COMPLETED received in PAX: no transition, only logged');
+    expect((await line(original))!.status).toBe('PROVISIONING');
   });
 });
 
@@ -375,6 +394,34 @@ describe('partial cancellation', () => {
 
     await send(broadband, 'KIT_DELIVERED', 'VOICE_AND_DATA_ORDER_COMPLETED');
     await until(broadband, (v) => v.status === 'ACTIVE', 'active');
+  });
+});
+
+describe('ceasing a live line', () => {
+  it('runs a cease Workflow that stops billing, undoes the line stage by stage, and moves the row to CE', async () => {
+    const accountId = newAccount();
+    const original = await activeSuperfast(accountId);
+    expect((await line(original))!.undo).toEqual([
+      [
+        { stepId: 'provider-order', name: 'Provider order', action: 'provider.ceaseVoiceAndData', ref: `SNS-${original}`, waitFor: 'CANCEL_ORDER_COMPLETED' },
+        { stepId: 'hub', name: 'Send hub', action: 'logistics.recall', ref: `CON-${original}/hub` },
+      ],
+    ]);
+
+    await order(accountId, [{ type: 'CEASE', lineId: original }]);
+    await untilCease(original, (v) => v.awaiting.includes('CANCEL_ORDER_COMPLETED'), 'waiting for the provider');
+    expect(billing.get(original)).toBe('STOPPED');
+    expect(calls).toContain(`cease SNS-${original}`);
+    expect(calls).toContain(`recall CON-${original}/hub`);
+
+    await sendToCease(original, 'CANCEL_ORDER_COMPLETED');
+    const ceased = await untilCease(original, (v) => v.status === 'CEASED', 'ceased');
+    expect(ceased.steps.map((s) => s.state)).toEqual(['undone', 'undone']);
+    expect(rowMoves.get(original)).toEqual(['RQ', 'AP', 'AC', 'CE']);
+
+    // The portfolio hears about it, and refuses to cease the line twice.
+    await poll(() => memo<PortfolioView>(portfolioWorkflowId(accountId), 'portfolio'), (p) => p.lines[0].status === 'CEASED', 'portfolio sees it ceased');
+    expect(await refusal(order(accountId, [{ type: 'CEASE', lineId: original }]))).toContain('ceased');
   });
 });
 

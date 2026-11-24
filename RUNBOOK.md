@@ -31,7 +31,7 @@ Point at the route on the broadband line: the provider order and the hub ran in 
 
 Say: "The order went to the customer's portfolio, which started one Workflow per product. Each product follows its own route. Nothing here is holding a thread while it waits for the hub to arrive."
 
-Proof: **Open portfolio in Temporal UI**. The portfolio Workflow is Running, with three child Workflows.
+Proof: **Open portfolio in Temporal UI**. The portfolio Workflow is Running, with three child Workflows, one per line.
 
 ### 2. Upgrade before activation (REVERT)
 
@@ -47,14 +47,18 @@ Variation: choose **PROVIDE (migrate)** instead. The old line finishes as Migrat
 
 ### 3. The race: activation and upgrade arrive together
 
-- **Activation first.** Place a new order. Send **KIT_DELIVERED** and **VOICE_AND_DATA_ORDER_COMPLETED**: the line is Active and billing. Upgrade it. The old line stays "Active and billing until … activates"; nothing is cancelled at the provider. Finish the upgrade's gates: the old line goes to CE and its billing stops.
+- **Activation first.** Place a new order. Send **KIT_DELIVERED** and **VOICE_AND_DATA_ORDER_COMPLETED**: the line is Active and billing, and its Workflow has completed ("Provisioning is done, so this line's Workflow has completed"). Upgrade it. The old line shows "Active, being replaced" and keeps billing; nothing is cancelled at the provider. Finish the upgrade's gates: the old line gets a **Cease** card ("the service migrated … nothing is undone downstream"), goes to CE, and its billing stops.
 - **Upgrade first.** Place a new order and upgrade it with REVERT. On the old line (now PAX), open **Send a different event** and click **VOICE_AND_DATA_ORDER_COMPLETED**. History shows "Logged only: VOICE_AND_DATA_ORDER_COMPLETED received in PAX: no transition, only logged".
 
-Say: "Each line handles its messages one at a time, in the order they arrived. Whichever comes first, activation or upgrade, decides the path. No locks, no status column to compare-and-swap."
+Say: "Each line handles its messages one at a time, in the order they arrived, and once a line is live the portfolio decides what happens to it. Whichever comes first, activation or upgrade, decides the path. No locks, no status column to compare-and-swap."
+
+Proof: in the Temporal UI, the old line's `line-…` Workflow is Completed and a `cease-…` Workflow ran after it, both children of the portfolio.
 
 ### 4. Cancel one product of an order
 
 On the customer from beat 1, select the Netflix line and click **Cancel this line**, then **Place cancellation order**. Netflix goes AP -> PAX -> CN (the partner account is deactivated). Sky TV carries on: send **BOX_DELIVERED** and it's Active.
+
+Then cease a live line: on Sky TV (now Active), click **Cease this line**, then **Place cease order**. The portfolio starts a cease Workflow: the **Cease** card shows billing stopped and the box recall, and the row goes AC -> CE. The Sky TV line's own Workflow had already completed when it activated; the cease gets what to undo from the plan the line handed the portfolio.
 
 Then try **Add products** with Broadband Superfast selected. The portfolio refuses it: "the customer already has Broadband Fibre Unlimited Pro …; raise an upgrade on it instead". Nothing is written to the Workflow's history for a refused order.
 
@@ -82,19 +86,17 @@ Proof: `make logs` shows `level=WARN msg="activity attempt failed; Temporal will
 
 ### 7. The Worker crashes
 
-With lines waiting, run `make crash-worker`. The console still shows every customer and line: it reads the memo through the Temporal service, not the Worker. Send a gate event; it's accepted, because Temporal stores the Signal. Run `make start-worker`: within about ten seconds (the Worker bundles its Workflow code on start) the line acts on it.
+With lines waiting, run `make crash-worker`. The console still shows every customer and line: it reads the memos through the Temporal service, not the Worker. Send a gate event; it's accepted, because Temporal stores the Signal. The History list keeps what the console last saw; a line you hadn't opened says its history needs a running Worker, because it comes from a Query. Run `make start-worker`: within about ten seconds (the Worker bundles its Workflow code on start) the line acts on the event and its history catches up.
 
 Proof: in the Temporal UI, the Event History has no repeated Activities.
 
 ## Show it in code
 
-Line numbers are for the current working tree. Replace them with commit permalinks once the repo has its first commit on `main`.
-
 ### Every order goes through the customer's portfolio
 
 **When to use it:** beat 1, 2 or 4, or when someone asks what level the Workflows are at.
 
-**Where it is:** `fulfilment/src/workflows.ts:91` (validator) and `:136` (handler); the start is in `fulfilment/src/api.ts` (`executeUpdateWithStart`).
+**Where it is:** `fulfilment/src/workflows.ts:132` (validator) and `fulfilment/src/workflows.ts:202` (handler); the start is in `fulfilment/src/api.ts` (`executeUpdateWithStart`).
 
 ```ts
 setHandler(placeOrderUpdate, (request): PortfolioView => {
@@ -108,47 +110,64 @@ setHandler(placeOrderUpdate, (request): PortfolioView => {
 
 - Update-With-Start starts the portfolio if the customer is new and delivers the order either way, in one call. The order ID is the Update ID, so a retried request is the same order.
 - The validator runs before the Update is written to history. A refused order leaves no trace, and the console shows the reason.
-- The portfolio starts each line as a Child Workflow with `parentClosePolicy: 'ABANDON'` (`:226`), because a line is a product holding that outlives any one run of the portfolio, which [continues as new](https://docs.temporal.io/develop/typescript/continue-as-new) when its history grows (`:269`).
+- The portfolio starts each line as a Child Workflow with `parentClosePolicy: 'ABANDON'` (`fulfilment/src/workflows.ts:294`), so a line keeps running when the portfolio [continues as new](https://docs.temporal.io/develop/typescript/continue-as-new) (`fulfilment/src/workflows.ts:345`).
 - Docs: [Message passing in TypeScript](https://docs.temporal.io/develop/typescript/message-passing), [Entity Workflows](https://docs.temporal.io/evaluate/use-cases-design-patterns#entity-workflows).
+
+### Bounded Workflows: a line ends at AC, a cease is its own Workflow
+
+**When to use it:** beat 3 or 4, or when someone asks how long Workflows run, or how they'd roll out new code.
+
+**Where it is:** `fulfilment/src/workflows.ts:644` (the line activates and completes), `fulfilment/src/workflows.ts:605` (the undo plan it hands over), `fulfilment/src/workflows.ts:189` (the portfolio starts a cease), `fulfilment/src/workflows.ts:691` (`ceaseLine`)
+
+```ts
+if (activated) {
+  await setRow('AC', 'ACTIVATED');
+  await fulfilment.startBilling({ lineId, accountId, product });
+  view.undo = undoPlan();          // what a cease would have to reverse
+  await publish('Active and billing');
+}                                 // ...and the Workflow completes
+```
+
+**What you need to understand:** only the portfolio lives for years, and it's a thin loop that continues as new. A line runs for days or weeks, and a cease until the provider confirms. Short histories, and code that's easy to roll out with [Worker Versioning](https://docs.temporal.io/worker-versioning): a line can be pinned to the version it started on without keeping old Workers running for years. The line hands the portfolio what it would need to undo (each step with the reference its system returned) in its last progress Signal; the cease works from that.
 
 ### Run a route from configuration
 
 **When to use it:** beat 1 or 5.
 
-**Where it is:** `fulfilment/src/workflows.ts:545` (load), `:472` (stages), `:446` (a step)
+**Where it is:** `fulfilment/src/workflows.ts:626` (load), `fulfilment/src/workflows.ts:542` (stages), `fulfilment/src/workflows.ts:516` (a step)
 
 ```ts
-view.route = await fulfilment.loadRoute(product);
+route = await fulfilment.loadRoute(product);
 // ...
-for (const stage of view.route!.stages) {
+for (const stage of route!.stages) {
   await Promise.all(stage.steps.map(runStep));
   if (interrupted()) break;
 }
 ```
 
-**What you need to understand:** the route is an Activity result, so it's recorded in the line's Event History. On replay the line gets the same route back, which is what pins it to its version. Each step's action is an Activity; its gate is a `condition` on Signals received (`:461`). A route can only use actions the code knows (`routeProblems` in `fulfilment/src/domain.ts`, checked before publishing and again when loading).
+**What you need to understand:** the route is an Activity result, so it's recorded in the line's Event History. On replay the line gets the same route back, which is what pins it to its version. Each step's action is an Activity; its gate is a `condition` on Signals received (`fulfilment/src/workflows.ts:531`). A route can only use actions the code knows (`routeProblems` in `fulfilment/src/domain.ts`, checked before publishing and again when loading).
 
 ### Move a running line to a new route version
 
 **When to use it:** beat 5.
 
-**Where it is:** `fulfilment/src/workflows.ts:388` (the Update) and `:514` (`adoptRoute`)
+**Where it is:** `fulfilment/src/workflows.ts:464` (the Update) and `fulfilment/src/workflows.ts:584` (`adoptRoute`)
 
 **What you need to understand:** the Update's validator refuses a line that isn't being provisioned. Its handler loads the version, so a missing one fails the Update. The main loop switches at its next gate: steps both versions share keep their state, new ones run, and removed ones are undone (compensate) or dropped. This is a business-level version of the route, separate from Temporal's [Worker Versioning](https://docs.temporal.io/worker-versioning), which is how the code itself would be rolled out.
 
-### Signals in arrival order settle the race
+### One Workflow decides each part of the race
 
 **When to use it:** beat 3.
 
-**Where it is:** `fulfilment/src/workflows.ts:355`
+**Where it is:** `fulfilment/src/workflows.ts:435` (the line) and `fulfilment/src/workflows.ts:181` (the portfolio)
 
-**What you need to understand:** a Workflow handles Signals one at a time. If activation arrives first, the line completes its route and the upgrade crossgrades the live service. If the upgrade arrives first, the activation isn't expected any more and is logged without a transition.
+**What you need to understand:** a Workflow handles Signals one at a time. The line decides whether it activated: if the upgrade arrives first, the line cancels or migrates, and a late activation is logged without a transition. Once a line is live, the portfolio decides: when it hears ACTIVE from a line being replaced, it releases the upgrade to crossgrade the live line, and when the upgrade is live it starts the cease. Diagram 4 in [docs/how-it-works.md](docs/how-it-works.md) shows both paths.
 
 ### Retry a failing downstream system until it recovers
 
 **When to use it:** beat 6.
 
-**Where it is:** `fulfilment/src/workflows.ts:53`
+**Where it is:** `fulfilment/src/workflows.ts:59`
 
 ```ts
 const fulfilment = proxyActivities<FulfilmentActivities>({
@@ -157,23 +176,23 @@ const fulfilment = proxyActivities<FulfilmentActivities>({
 });
 ```
 
-**What you need to understand:** every Activity uses this policy: 1s, 2s, 4s, 8s, then every 10s, with no attempt limit, because giving up halfway would leave Portfolio, the provider and billing disagreeing. A 4xx is thrown as non-retryable in `fulfilment/src/activities.ts`. Each downstream call is safe to repeat: each system keys requests by line and step. Billing starts only after the row reaches AC (`:595`). Docs: [Retry policies](https://docs.temporal.io/encyclopedia/retry-policies).
+**What you need to understand:** every Activity uses this policy: 1s, 2s, 4s, 8s, then every 10s, with no attempt limit, because giving up halfway would leave Portfolio, the provider and billing disagreeing. A 4xx is thrown as non-retryable in `fulfilment/src/activities.ts`. Each downstream call is safe to repeat: each system keys requests by line and step. Billing starts only after the row reaches AC (`fulfilment/src/workflows.ts:652`). Docs: [Retry policies](https://docs.temporal.io/encyclopedia/retry-policies).
 
-### Show state without asking the Worker
+### Show state without asking the Worker, and history when it's there
 
 **When to use it:** beat 7, or when someone asks how an app shows live status.
 
-**Where it is:** `fulfilment/src/workflows.ts:307`, read in `fulfilment/src/api.ts` (`/api/console`)
+**Where it is:** `fulfilment/src/workflows.ts:387` (the memo), `fulfilment/src/workflows.ts:68` (the history Query), `fulfilment/src/api.ts:102` (the API asks for history only when `rev` changes)
 
-**What you need to understand:** each Workflow writes its view to the memo as it changes. The API reads lines with List (filtered by the `AccountId` Search Attribute) and the selected line with Describe, including pending Activity retries. The Temporal service answers these without a Worker. A Query would need a running Worker and costs an Action per call on Temporal Cloud. `RowStatus` is a Search Attribute too, so an operator can find lines in the Temporal UI with `RowStatus="PAX"`.
+**What you need to understand:** each Workflow writes a small view to its memo as it changes: status, row state, step states, what it waits for, and a `rev` that changes on every write. The API reads lines with List (filtered by the `AccountId` Search Attribute) and the selected line with Describe, including pending Activity retries. The Temporal service answers these without a Worker. The history isn't in the memo, so a memo write doesn't copy the whole history into the Event History again. It comes from the `history` Query, which needs a Worker and costs an Action per call on Temporal Cloud, so the API sends it only when `rev` has moved on. `RowStatus` is a Search Attribute too, so an operator can find lines in the Temporal UI with `RowStatus="PAX"`.
 
 ### Where the demo machinery lives
 
-The simulated systems, their Healthy/Slow/Failing switch and the seed routes are in `downstream/src/`. The Workflows and Activities don't know they're talking to a simulation; in a real system the Activities' URLs point at the real services, and callbacks arrive at an endpoint that sends the same Signal as the console's buttons (`fulfilment/src/api.ts`, `/api/lines/:lineId/events`).
+The simulated systems, their Healthy/Slow/Failing switch and the seed routes are in `downstream/src/`. The Workflows and Activities don't know they're talking to a simulation; in a real system the Activities' URLs point at the real services, and callbacks arrive at an endpoint that sends the same Signal as the console's buttons (`fulfilment/src/api.ts:283`): to the line while it's provisioning, or to its cease.
 
 ## Reset and tear down
 
-- Between runs: **Downstream systems** -> **Reset sandbox** deletes every portfolio and line execution, resets the routes to v1, and clears the simulated systems. Or run `make reset` for a fresh dev server.
+- Between runs: **Downstream systems** -> **Reset sandbox** deletes every portfolio, line and cease execution, resets the routes to v1, and clears the simulated systems. Or run `make reset` for a fresh dev server.
 - After the session: `make down`. Nothing runs on Temporal Cloud.
 
 ## When something goes wrong
@@ -185,6 +204,8 @@ The simulated systems, their Healthy/Slow/Failing switch and the seed routes are
 | A line says Retrying and never moves on | A downstream system is still set to Failing | **Downstream systems** -> set it to Healthy |
 | The portfolio refuses an order | Intended: it conflicts with what the customer holds (a second broadband line, a second upgrade of the same line) | Read the reason; upgrade or cancel the existing line instead |
 | **Move to vN** is refused | The line is no longer being provisioned, or is being cancelled | Only lines still being provisioned can move |
+| A callback returns "nothing is running for …" | The line has finished (active, cancelled or migrated) and no cease is running, so nothing waits for that event | Intended; send events to lines still in progress |
+| A line's History says it needs a running Worker | The Worker is down, and the API hadn't fetched that line's history before | `make start-worker`; the rest of the line view keeps updating meanwhile |
 | Lines fail after a code change | Running lines replay against the new Workflow code | **Reset sandbox** after changing Workflow code |
 
 ## Run it locally

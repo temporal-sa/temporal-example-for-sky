@@ -1,5 +1,5 @@
 import { type ConsoleData, PRODUCTS, type Route } from './api';
-import { LineDetail, Timeline } from './LineDetail';
+import { HistoryNote, LineDetail, Timeline } from './LineDetail';
 import { StatusBadge, billingText, lineStatus, time } from './status';
 
 interface Props {
@@ -118,8 +118,9 @@ export function CustomerPanel({ customer, line, routes, onSelectLine, onAddProdu
       </section>
 
       <details className="disclosure">
-        <summary>Portfolio history ({portfolio.timeline.length})</summary>
-        <Timeline entries={portfolio.timeline} />
+        <summary>Portfolio history ({customer.timeline.length})</summary>
+        <HistoryNote current={customer.historyCurrent} empty={customer.timeline.length === 0} />
+        <Timeline entries={customer.timeline} />
       </details>
     </div>
   );

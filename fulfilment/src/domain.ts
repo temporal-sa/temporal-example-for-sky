@@ -142,6 +142,8 @@ export interface OrderRecord {
 
 // --- Product lines ------------------------------------------------------------------------------
 
+// PROVISIONING until the line activates or is cancelled; then its Workflow completes. A live line is
+// ceased by its own Workflow (ceaseLine), which reports CEASED.
 export type LineStatus = 'PROVISIONING' | 'ACTIVE' | 'CANCELLED' | 'MIGRATED' | 'CEASED';
 
 export type StepState = 'pending' | 'running' | 'waiting' | 'done' | 'undoing' | 'undone' | 'dropped';
@@ -156,6 +158,19 @@ export interface LineInput {
   replaces?: string;
 }
 
+// One step a cease has to reverse, with the reference the forward action returned.
+export interface UndoStep {
+  stepId: string;
+  name: string;
+  action: ActionName;
+  ref: string;
+  waitFor?: EventName;
+}
+
+// What a live line hands over when it activates: the steps to reverse if it's ever ceased, stage by
+// stage in route order. The cease undoes them last stage first.
+export type UndoPlan = UndoStep[][];
+
 export interface LineSummary {
   lineId: string;
   orderId: string;
@@ -167,6 +182,7 @@ export interface LineSummary {
   replaces?: string;
   replacedBy?: string;
   billing: Billing;
+  undo?: UndoPlan;
 }
 
 export interface Billing {
@@ -181,18 +197,18 @@ export interface TimelineEntry {
   tone: 'info' | 'ignored';
 }
 
-
-// The line as the console shows it. The Workflow keeps this in its memo, so the API reads it with
-// Describe or List and no Worker is involved.
+// The line as the console lists it, kept in the Workflow's memo so the API reads it with Describe or
+// List and no Worker is involved. It stays small: the route comes from the catalogue by version, and
+// the history from the `history` Query. `rev` changes on every write, so the API asks for the
+// history again only when there is something new.
 export interface LineView extends LineSummary {
   accountId: string;
-  route?: Route;
   steps: Record<string, StepState>;
   awaiting: EventName[];
   // Steps a route change took out of this line, and what happened to them.
   retired: { id: string; name: string; fromVersion: number; state: StepState }[];
   phase: string;
-  timeline: TimelineEntry[];
+  rev: number;
 }
 
 export function newLineView(input: LineInput): LineView {
@@ -205,13 +221,13 @@ export function newLineView(input: LineInput): LineView {
     awaiting: [],
     retired: [],
     phase: input.replaces ? `Held until ${input.replaces} is released` : 'Waiting for a Worker to load its route',
-    timeline: [],
+    rev: 0,
   };
 }
 
-export function lineSummary(view: LineView): LineSummary {
-  const { lineId, orderId, product, status, rowStatus, routeVersion, providerOrderRef, replaces, replacedBy, billing } = view;
-  return { lineId, orderId, product, status, rowStatus, routeVersion, providerOrderRef, replaces, replacedBy, billing };
+export function lineSummary(view: LineSummary): LineSummary {
+  const { lineId, orderId, product, status, rowStatus, routeVersion, providerOrderRef, replaces, replacedBy, billing, undo } = view;
+  return { lineId, orderId, product, status, rowStatus, routeVersion, providerOrderRef, replaces, replacedBy, billing, undo };
 }
 
 // What a line tells the portfolio when it lets go of the customer's line for its replacement.
@@ -223,18 +239,62 @@ export interface Release {
   migrateFrom?: string;
 }
 
-// --- Portfolio ------------------------------------------------------------------------------------
+// --- Ceasing a live line --------------------------------------------------------------------------
 
-// The portfolio's copy of each line, plus what the portfolio itself has asked of it.
-export interface PortfolioLine extends LineSummary {
-  ceaseRequested?: boolean;
+export interface CeaseInput {
+  line: LineSummary & { accountId: string };
+  reason: string;
+  // Set when the line's replacement is live: the service was migrated, so billing stops but
+  // nothing is undone downstream.
+  replacedBy?: string;
 }
 
+export interface CeaseView {
+  lineId: string;
+  accountId: string;
+  reason: string;
+  replacedBy?: string;
+  status: 'CEASING' | 'CEASED';
+  rowStatus: RowStatus;
+  billing: Billing;
+  steps: { stepId: string; name: string; state: StepState }[];
+  awaiting: EventName[];
+  phase: string;
+  rev: number;
+}
+
+export function newCeaseView({ line, reason, replacedBy }: CeaseInput): CeaseView {
+  const steps = replacedBy ? [] : (line.undo ?? []).flat().map(({ stepId, name }) => ({ stepId, name, state: 'pending' as StepState }));
+  return {
+    lineId: line.lineId,
+    accountId: line.accountId,
+    reason,
+    replacedBy,
+    status: 'CEASING',
+    rowStatus: line.rowStatus,
+    billing: line.billing,
+    steps,
+    awaiting: [],
+    phase: 'Waiting for a Worker to start the cease',
+    rev: 0,
+  };
+}
+
+// --- Portfolio ------------------------------------------------------------------------------------
+
+// The portfolio's copy of each line, plus what the portfolio itself has done about it.
+export interface PortfolioLine extends LineSummary {
+  ceaseRequested?: boolean; // the customer ordered a cease
+  ceaseStarted?: boolean; // a ceaseLine Workflow is running or has run
+  released?: boolean; // its replacement has been told it can go ahead
+}
+
+// The portfolio's memo. Its history is served by the `history` Query, like a line's.
 export interface PortfolioView {
   accountId: string;
   lines: PortfolioLine[];
   orders: OrderRecord[];
-  timeline: TimelineEntry[];
+  rev: number;
 }
 
 export function portfolioWorkflowId(accountId: string): string {
@@ -247,4 +307,8 @@ export function lineIdFor(orderId: string, n: number): string {
 
 export function lineWorkflowId(lineId: string): string {
   return `line-${lineId}`;
+}
+
+export function ceaseWorkflowId(lineId: string): string {
+  return `cease-${lineId}`;
 }

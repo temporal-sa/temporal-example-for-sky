@@ -26,7 +26,7 @@ export const STEP_STATUS: Record<StepState, { status: Status; label: string }> =
   dropped: { status: 'skipped', label: 'Not needed' },
 };
 
-export function lineStatus(line: LineListItem, pending: PendingWork[] = []): { status: Status; label: string } {
+export function lineStatus(line: Pick<LineListItem, 'status' | 'phase' | 'rowStatus' | 'awaiting' | 'replacedBy'> & { cease: { status: string } | null }, pending: PendingWork[] = []): { status: Status; label: string } {
   if (pending.some((work) => work.attempt > 1)) return { status: 'retrying', label: 'Retrying' };
   switch (line.status) {
     case 'CANCELLED':
@@ -36,7 +36,7 @@ export function lineStatus(line: LineListItem, pending: PendingWork[] = []): { s
     case 'CEASED':
       return { status: 'skipped', label: 'Ceased' };
     case 'ACTIVE':
-      if (line.awaiting.length > 0) return { status: 'waiting', label: 'Ceasing' };
+      if (line.cease) return { status: line.awaiting.length > 0 ? 'waiting' : 'active', label: 'Ceasing' };
       return { status: 'completed', label: line.replacedBy ? 'Active, being replaced' : 'Active' };
     case 'PROVISIONING':
       if (line.phase.startsWith('Held')) return { status: 'waiting', label: 'Held for old line' };
