@@ -96,7 +96,7 @@ Proof: in the Temporal UI, the Event History has no repeated Activities.
 
 **When to use it:** beat 1, 2 or 4, or when someone asks what level the Workflows are at.
 
-**Where it is:** `fulfilment/src/workflows.ts:132` (validator) and `fulfilment/src/workflows.ts:202` (handler); the start is in `fulfilment/src/api.ts` (`executeUpdateWithStart`).
+**Where it is:** [`fulfilment/src/workflows.ts:132`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L132) (validator) and [`fulfilment/src/workflows.ts:202`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L202) (handler); the start is in `fulfilment/src/api.ts` (`executeUpdateWithStart`).
 
 ```ts
 setHandler(placeOrderUpdate, (request): PortfolioView => {
@@ -110,14 +110,14 @@ setHandler(placeOrderUpdate, (request): PortfolioView => {
 
 - Update-With-Start starts the portfolio if the customer is new and delivers the order either way, in one call. The order ID is the Update ID, so a retried request is the same order.
 - The validator runs before the Update is written to history. A refused order leaves no trace, and the console shows the reason.
-- The portfolio starts each line as a Child Workflow with `parentClosePolicy: 'ABANDON'` (`fulfilment/src/workflows.ts:294`), so a line keeps running when the portfolio [continues as new](https://docs.temporal.io/develop/typescript/continue-as-new) (`fulfilment/src/workflows.ts:345`).
+- The portfolio starts each line as a Child Workflow with `parentClosePolicy: 'ABANDON'` ([`fulfilment/src/workflows.ts:294`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L294)), so a line keeps running when the portfolio [continues as new](https://docs.temporal.io/develop/typescript/continue-as-new) ([`fulfilment/src/workflows.ts:345`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L345)).
 - Docs: [Message passing in TypeScript](https://docs.temporal.io/develop/typescript/message-passing), [Entity Workflows](https://docs.temporal.io/evaluate/use-cases-design-patterns#entity-workflows).
 
 ### Bounded Workflows: a line ends at AC, a cease is its own Workflow
 
 **When to use it:** beat 3 or 4, or when someone asks how long Workflows run, or how they'd roll out new code.
 
-**Where it is:** `fulfilment/src/workflows.ts:644` (the line activates and completes), `fulfilment/src/workflows.ts:605` (the undo plan it hands over), `fulfilment/src/workflows.ts:189` (the portfolio starts a cease), `fulfilment/src/workflows.ts:691` (`ceaseLine`)
+**Where it is:** [`fulfilment/src/workflows.ts:644`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L644) (the line activates and completes), [`fulfilment/src/workflows.ts:605`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L605) (the undo plan it hands over), [`fulfilment/src/workflows.ts:189`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L189) (the portfolio starts a cease), [`fulfilment/src/workflows.ts:691`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L691) (`ceaseLine`)
 
 ```ts
 if (activated) {
@@ -134,7 +134,7 @@ if (activated) {
 
 **When to use it:** beat 1 or 5.
 
-**Where it is:** `fulfilment/src/workflows.ts:626` (load), `fulfilment/src/workflows.ts:542` (stages), `fulfilment/src/workflows.ts:516` (a step)
+**Where it is:** [`fulfilment/src/workflows.ts:626`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L626) (load), [`fulfilment/src/workflows.ts:542`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L542) (stages), [`fulfilment/src/workflows.ts:516`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L516) (a step)
 
 ```ts
 route = await fulfilment.loadRoute(product);
@@ -145,13 +145,13 @@ for (const stage of route!.stages) {
 }
 ```
 
-**What you need to understand:** the route is an Activity result, so it's recorded in the line's Event History. On replay the line gets the same route back, which is what pins it to its version. Each step's action is an Activity; its gate is a `condition` on Signals received (`fulfilment/src/workflows.ts:531`). A route can only use actions the code knows (`routeProblems` in `fulfilment/src/domain.ts`, checked before publishing and again when loading).
+**What you need to understand:** the route is an Activity result, so it's recorded in the line's Event History. On replay the line gets the same route back, which is what pins it to its version. Each step's action is an Activity; its gate is a `condition` on Signals received ([`fulfilment/src/workflows.ts:531`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L531)). A route can only use actions the code knows (`routeProblems` in `fulfilment/src/domain.ts`, checked before publishing and again when loading).
 
 ### Move a running line to a new route version
 
 **When to use it:** beat 5.
 
-**Where it is:** `fulfilment/src/workflows.ts:464` (the Update) and `fulfilment/src/workflows.ts:584` (`adoptRoute`)
+**Where it is:** [`fulfilment/src/workflows.ts:464`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L464) (the Update) and [`fulfilment/src/workflows.ts:584`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L584) (`adoptRoute`)
 
 **What you need to understand:** the Update's validator refuses a line that isn't being provisioned. Its handler loads the version, so a missing one fails the Update. The main loop switches at its next gate: steps both versions share keep their state, new ones run, and removed ones are undone (compensate) or dropped. This is a business-level version of the route, separate from Temporal's [Worker Versioning](https://docs.temporal.io/worker-versioning), which is how the code itself would be rolled out.
 
@@ -159,7 +159,7 @@ for (const stage of route!.stages) {
 
 **When to use it:** beat 3.
 
-**Where it is:** `fulfilment/src/workflows.ts:435` (the line) and `fulfilment/src/workflows.ts:181` (the portfolio)
+**Where it is:** [`fulfilment/src/workflows.ts:435`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L435) (the line) and [`fulfilment/src/workflows.ts:181`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L181) (the portfolio)
 
 **What you need to understand:** a Workflow handles Signals one at a time. The line decides whether it activated: if the upgrade arrives first, the line cancels or migrates, and a late activation is logged without a transition. Once a line is live, the portfolio decides: when it hears ACTIVE from a line being replaced, it releases the upgrade to crossgrade the live line, and when the upgrade is live it starts the cease. Diagram 4 in [docs/how-it-works.md](docs/how-it-works.md) shows both paths.
 
@@ -167,7 +167,7 @@ for (const stage of route!.stages) {
 
 **When to use it:** beat 6.
 
-**Where it is:** `fulfilment/src/workflows.ts:59`
+**Where it is:** [`fulfilment/src/workflows.ts:59`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L59)
 
 ```ts
 const fulfilment = proxyActivities<FulfilmentActivities>({
@@ -176,19 +176,19 @@ const fulfilment = proxyActivities<FulfilmentActivities>({
 });
 ```
 
-**What you need to understand:** every Activity uses this policy: 1s, 2s, 4s, 8s, then every 10s, with no attempt limit, because giving up halfway would leave Portfolio, the provider and billing disagreeing. A 4xx is thrown as non-retryable in `fulfilment/src/activities.ts`. Each downstream call is safe to repeat: each system keys requests by line and step. Billing starts only after the row reaches AC (`fulfilment/src/workflows.ts:652`). Docs: [Retry policies](https://docs.temporal.io/encyclopedia/retry-policies).
+**What you need to understand:** every Activity uses this policy: 1s, 2s, 4s, 8s, then every 10s, with no attempt limit, because giving up halfway would leave Portfolio, the provider and billing disagreeing. A 4xx is thrown as non-retryable in `fulfilment/src/activities.ts`. Each downstream call is safe to repeat: each system keys requests by line and step. Billing starts only after the row reaches AC ([`fulfilment/src/workflows.ts:652`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L652)). Docs: [Retry policies](https://docs.temporal.io/encyclopedia/retry-policies).
 
 ### Show state without asking the Worker, and history when it's there
 
 **When to use it:** beat 7, or when someone asks how an app shows live status.
 
-**Where it is:** `fulfilment/src/workflows.ts:387` (the memo), `fulfilment/src/workflows.ts:68` (the history Query), `fulfilment/src/api.ts:102` (the API asks for history only when `rev` changes)
+**Where it is:** [`fulfilment/src/workflows.ts:387`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L387) (the memo), [`fulfilment/src/workflows.ts:68`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/workflows.ts#L68) (the history Query), [`fulfilment/src/api.ts:102`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/api.ts#L102) (the API asks for history only when `rev` changes)
 
 **What you need to understand:** each Workflow writes a small view to its memo as it changes: status, row state, step states, what it waits for, and a `rev` that changes on every write. The API reads lines with List (filtered by the `AccountId` Search Attribute) and the selected line with Describe, including pending Activity retries. The Temporal service answers these without a Worker. The history isn't in the memo, so a memo write doesn't copy the whole history into the Event History again. It comes from the `history` Query, which needs a Worker and costs an Action per call on Temporal Cloud, so the API sends it only when `rev` has moved on. `RowStatus` is a Search Attribute too, so an operator can find lines in the Temporal UI with `RowStatus="PAX"`.
 
 ### Where the demo machinery lives
 
-The simulated systems, their Healthy/Slow/Failing switch and the seed routes are in `downstream/src/`. The Workflows and Activities don't know they're talking to a simulation; in a real system the Activities' URLs point at the real services, and callbacks arrive at an endpoint that sends the same Signal as the console's buttons (`fulfilment/src/api.ts:283`): to the line while it's provisioning, or to its cease.
+The simulated systems, their Healthy/Slow/Failing switch and the seed routes are in `downstream/src/`. The Workflows and Activities don't know they're talking to a simulation; in a real system the Activities' URLs point at the real services, and callbacks arrive at an endpoint that sends the same Signal as the console's buttons ([`fulfilment/src/api.ts:283`](https://github.com/temporal-sa/temporal-example-for-sky/blob/49c748683d1b3a51558e68131feb6955d5690588/fulfilment/src/api.ts#L283)): to the line while it's provisioning, or to its cease.
 
 ## Reset and tear down
 
